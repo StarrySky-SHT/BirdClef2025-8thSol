@@ -1,7 +1,11 @@
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '3'
+
+import torch.utils
+os.environ['CUDA_VISIBLE_DEVICES'] = '2'
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
+import sys
+sys.path.append('/root/projects/BirdClef2025/BirdCLEF2023-30th-place-solution-master/')
 from email.mime import audio
 import torch
 import pandas as pd
@@ -13,8 +17,8 @@ import os
 import sys
 from config import CFG  
 import albumentations as A
-from dataset import BirdDataset,fetch_scheduler,AudioAug,BirdDatasetTwoLabel
-from torch.utils.data import Dataset,DataLoader
+from dataset import BirdDataset,fetch_scheduler,AudioAug,BirdDatasetTwoLabel,BirdDatasetSplitTrain
+from torch.utils.data import Dataset,DataLoader,WeightedRandomSampler
 from torch import optim
 from model import BirdClefModel,BirdClefSEDModel,BirdClefSEDAttModel
 from torch.cuda import amp  
@@ -26,7 +30,7 @@ import sklearn
 from torchtoolbox.tools import mixup
 from torch.nn.functional import binary_cross_entropy_with_logits,binary_cross_entropy
 from utils import *
-from losses import SmoothBCEFocalLoss,MultiLoss,MultiLossWeighting
+from losses import SmoothBCEFocalLoss,MultiLoss,MultiLossWeighting,BCELoss
 import  audiomentations as AA
 from torchtoolbox.tools import cutmix_data,MixingDataController
 import torch.nn.functional as F
@@ -66,22 +70,37 @@ def set_seed(seed = 42):
 set_seed(42)
 
 df_train = pd.read_csv(CFG.train_path)
-df_valid = pd.read_csv(CFG.valid_path)
+df_valid = pd.read_csv(CFG.train_path)
 df_valid = df_valid.sample(frac=0.1,random_state=42)
 
 df_train['path'] = CFG.data_root+df_train['filename']
 df_valid['path'] = CFG.data_root+df_valid['filename']
 
+# pesudo_df = pd.read_csv('/root/projects/BirdClef2025/BirdCLEF2023-30th-place-solution-master/usefulFunc/pesudo_labelv13_ensemble.csv')
+# pesudo_df['primary_label'] = pesudo_df[pesudo_df.columns[1:]].idxmax(axis=1)
+# pesudo_df['rating'] = 5
+# df_train = pd.concat((df_train,pesudo_df))
+external_train = pd.read_csv('/root/projects/BirdClef2025/data/external_train.csv')
+df_train = pd.concat((df_train,external_train))
+
 df_train = pd.concat([df_train, pd.get_dummies(df_train['primary_label'])], axis=1)
 df_valid = pd.concat([df_valid, pd.get_dummies(df_valid['primary_label'])], axis=1)
 
-birds = list(df_train.primary_label.unique())
+birds = list(pd.get_dummies(df_train['primary_label']).columns)
 missing_birds = list(set(list(df_train.primary_label.unique())).difference(list(df_valid.primary_label.unique())))
 non_missing_birds = list(set(list(df_train.primary_label.unique())).difference(missing_birds))
 df_valid[missing_birds] = 0
 df_valid = df_valid[df_train.columns] ## Fix order
 
 df_train = upsample_data(df_train,thr=50)
+
+# sample_weights = (
+#     df_train['primary_label'].value_counts() / 
+#     df_train['primary_label'].value_counts().sum()
+# )  ** (-0.5)
+# sample_weights_dict = dict(sample_weights)
+# sample_weights = df_train['primary_label'].map(lambda x:sample_weights_dict[x])
+# sampler = WeightedRandomSampler(sample_weights,num_samples=len(df_train))
 
 all_bgnoise = glob('/root/projects/BirdClef2025/externaldata/backgroundnoise/*/*')
 all_bgnoise.sort()
@@ -103,15 +122,15 @@ wav_transform = Compose(
                     AA.Gain(min_gain_db=-12, max_gain_db=12, p=0.2),
                 ]
             )
-train_set = BirdDatasetTwoLabel(df_train,sr = CFG.sample_rate,duration = CFG.duration,train = True,audio_augmentations=wav_transform)
-val_set = BirdDatasetTwoLabel(df_valid,sr = CFG.sample_rate,duration = CFG.infer_duration,train = False)
-trainloader = DataLoader(train_set,batch_size=CFG.batch_size,shuffle=True,num_workers=16,pin_memory=True)
+train_set = BirdDatasetTwoLabel(df_train,bird_cols=birds,sr = CFG.sample_rate,duration = CFG.duration,train = True,audio_augmentations=wav_transform)
+val_set = BirdDatasetTwoLabel(df_valid,bird_cols=birds,sr = CFG.sample_rate,duration = CFG.infer_duration,train = False)
+trainloader = DataLoader(train_set,batch_size=CFG.batch_size,num_workers=16,pin_memory=True,shuffle=True)
 valloader = DataLoader(val_set,batch_size=CFG.batch_size,shuffle=False,num_workers=16,pin_memory=True)
 
 # loss
 # criterion = torch.nn.BCEWithLogitsLoss()
-criterion = nn.BCELoss()    
-loss_ = MultiLossWeighting(smoothing=CFG.smoothing_factor)
+loss_ = BCELoss()
+# loss_ = MultiLossWeighting(smoothing=CFG.smoothing_factor)
 
 # model
 model = BirdClefSEDAttModel(CFG.model,num_classes=CFG.num_classes,pretrained=CFG.pretrained).cuda()
@@ -138,9 +157,6 @@ else:
 
 optimizer = optim.Adam(to_optim,lr=CFG.lr)
 scheduler = fetch_scheduler(optimizer,len(trainloader))
-
-cutmix_aug = MixingDataController(mixup=CFG.use_mixup,cutmix=CFG.use_cutmix,mixup_prob=CFG.mixup_pro,cutmix_prob=CFG.cutmix_pro)
-mixup_clef = Mixup(mix_beta=1)
 
 best_cmAP = -np.inf
 current_time = time.strftime("%Y-%m-%dT%H:%M", time.localtime())
@@ -211,8 +227,11 @@ for i in range(CFG.epochs):
     # cmAP_pad3_score = padded_cmap(gt_df, pred_df, padding_factor = 3)
     cmAP_pad5_score,cmAP_pad5_score_ = padded_cmap(gt_df, pred_df, padding_factor = 5)
     AP_score = sklearn.metrics.label_ranking_average_precision_score(np.int16(gtall_numpy),predall_numpy)
+    scored_gt = gtall_numpy[:,np.where(gtall_numpy.sum(axis=0)!=0)[0]]
+    scored_pred = predall_numpy[:,np.where(gtall_numpy.sum(axis=0)!=0)[0]]
+    macro_auc = sklearn.metrics.roc_auc_score(np.int16(scored_gt),scored_pred,)
 
-    logging.info('epoch:[{}/{}]  cmAP:{:.4f} AP:{:.4f}'.format(i,CFG.epochs,cmAP_pad5_score,AP_score))
+    logging.info('epoch:[{}/{}]  cmAP:{:.4f} AP:{:.4f} AUC:{:.4f}'.format(i,CFG.epochs,cmAP_pad5_score,AP_score,macro_auc))
 
     if cmAP_pad5_score> best_cmAP:
         last_best_cmAP = best_cmAP

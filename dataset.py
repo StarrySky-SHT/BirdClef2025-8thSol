@@ -5,7 +5,8 @@ from torch.optim import lr_scheduler
 import librosa as lb
 import soundfile as sf
 import audiomentations as AA
-from utils import upsample_data,downsample_data
+from utils import upsample_data,downsample_data,sumix
+import pandas as pd
 
 # Generates random integer
 def random_int(minval=0, maxval=1):
@@ -129,7 +130,7 @@ class BirdDataset(torch.utils.data.Dataset):
 
 class BirdDatasetTwoLabel(torch.utils.data.Dataset):
 
-    def __init__(self,df, sr = CFG.sample_rate, duration = CFG.duration, audio_augmentations = None, train = True):
+    def __init__(self,df, bird_cols = None,sr = CFG.sample_rate, duration = CFG.duration, audio_augmentations = None, train = True):
         self.df = df
         self.sr = sr 
         self.train = train
@@ -137,6 +138,7 @@ class BirdDatasetTwoLabel(torch.utils.data.Dataset):
         self.audio_length = self.duration * sr
         self.use_mixup = CFG.use_mixup
         self.audio_augmentations = audio_augmentations
+        self.bird_cols = bird_cols
 
     def __len__(self):
         return len(self.df)
@@ -200,7 +202,7 @@ class BirdDatasetTwoLabel(torch.utils.data.Dataset):
             if row['secondary_labels'] != "['']" and row['secondary_labels'] != '[]' and type(row['secondary_labels']) != float:
                 labellist = row['secondary_labels'].replace('[','').replace(']','').replace('\'','').split(', ')
                 for j in labellist:
-                    row[j] = 0.95
+                    row[j] = 0.995
             audio = self.crop_or_pad(audio,self.audio_length,self.train) # constant length (l,) array
             if self.audio_augmentations:
                 audio = self.audio_augmentations(audio)
@@ -216,6 +218,31 @@ class BirdDatasetTwoLabel(torch.utils.data.Dataset):
             # weight = None
         else:
             audio = self.get_first_duration(audio)
+            if row['rating']!=0:
+                if np.isnan(row['rating']):
+                    weight = 1
+                elif type(row['rating'])==np.dtype(np.float64):
+                    weight = row['rating']/5
+                else:
+                    weight = 1
+            else:
+                weight = 1
+        return torch.from_numpy(audio),torch.tensor(row[self.bird_cols]).float(),torch.tensor(weight).float()
+    
+class BirdDatasetSplitTrain(BirdDatasetTwoLabel):
+    def __init__(self, df, sr=CFG.sample_rate, duration=CFG.duration, audio_augmentations=None, train=True):
+        super().__init__(df, sr, duration, audio_augmentations, train)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx].copy()
+        audio,orig_sr = sf.read(row['path'].replace('.mp3','.ogg'))
+        if len(audio.shape)==2:
+            audio = audio[:,0]
+        if orig_sr!=self.sr:
+            audio = lb.resample(audio, orig_sr=orig_sr, target_sr=self.sr, res_type="kaiser_fast")
+
+        if self.train:
+            audio = self.crop_or_pad(audio,self.audio_length,self.train) # constant length (l,) array
             if self.audio_augmentations:
                 audio = self.audio_augmentations(audio)
             if row['rating']!=0:
@@ -227,7 +254,45 @@ class BirdDatasetTwoLabel(torch.utils.data.Dataset):
                     weight = 1
             else:
                 weight = 1
+            # weight = None
+        else:
+            audio = self.get_first_duration(audio)
+            if row['rating']!=0:
+                if np.isnan(row['rating']):
+                    weight = 1
+                elif type(row['rating'])==np.dtype(np.float64):
+                    weight = row['rating']/5
+                else:
+                    weight = 1
+            else:
+                weight = 1
         return torch.from_numpy(audio),torch.tensor(row[14:]).float(),torch.tensor(weight).float()
+
+
+class BirdDatasetWithPseudoLabel(BirdDatasetTwoLabel):
+    def __init__(self, df, bird_cols=None, sr=CFG.sample_rate, duration=CFG.duration, audio_augmentations=None, train=True):
+        super().__init__(df, bird_cols, sr, duration, audio_augmentations, train)
+    
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx].copy()
+        audio,orig_sr = sf.read(row['path'].replace('.mp3','.ogg'))
+        if len(audio.shape)==2:
+            audio = audio[:,0]
+        if orig_sr!=self.sr:
+            audio = lb.resample(audio, orig_sr=orig_sr, target_sr=self.sr, res_type="kaiser_fast")
+
+        if self.train:
+            if row['secondary_labels'] != "['']" and row['secondary_labels'] != '[]' and type(row['secondary_labels']) != float:
+                labellist = row['secondary_labels'].replace('[','').replace(']','').replace('\'','').split(', ')
+                for j in labellist:
+                    row[j] = 0.995
+            audio = self.crop_or_pad(audio,self.audio_length,self.train) # constant length (l,) array
+            if self.audio_augmentations:
+                audio = self.audio_augmentations(audio)
+        else:
+            audio = self.get_first_duration(audio)
+        weight = 0 if self.df.iloc[idx]['is_pesudo'] else 1
+        return torch.from_numpy(audio),torch.tensor(row[self.bird_cols]).float(),torch.tensor(weight).float()
 
 def fetch_scheduler(optimizer,steps_per_epoch,epochs=CFG.epochs):
     if CFG.scheduler == 'CosineAnnealingLR':
@@ -253,11 +318,15 @@ def fetch_scheduler(optimizer,steps_per_epoch,epochs=CFG.epochs):
 if __name__ == '__main__':
     import pandas as pd
     df = pd.read_csv('/root/projects/BirdClef2025/data/train.csv')
-    
+    df['path'] = CFG.data_root+df['filename']
     df = pd.concat([df, pd.get_dummies(df['primary_label'])], axis=1)
+    
     df = upsample_data(df,thr=50)
     df = downsample_data(df,thr=400)
 
-    dataset = BirdDataset(df)
-    data1 = dataset.__getitem__(10)
+    pesudo_df = pd.read_csv('/root/projects/BirdClef2025/BirdCLEF2023-30th-place-solution-master/usefulFunc/pesudo_label_0.5.csv')
+    pesudo_df['path'] = '/root/projects/BirdClef2025/data/train_soundscapes_20s/'+pesudo_df['filename']
+
+    dataset = BirdDatasetWithPseudoLabel(df, pesudo_df, sr=CFG.sample_rate, duration=CFG.duration, train=True)
+    data1 = dataset.__getitem__(300)
     print(1)

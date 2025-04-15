@@ -1,3 +1,11 @@
+import os
+
+import torch.utils
+os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+
+import sys
+sys.path.append('/root/projects/BirdClef2025/BirdCLEF2023-30th-place-solution-master/')
 from email.mime import audio
 import torch
 import pandas as pd
@@ -9,10 +17,10 @@ import os
 import sys
 from config import CFG  
 import albumentations as A
-from dataset import BirdDataset,fetch_scheduler,AudioAug
-from torch.utils.data import Dataset,DataLoader
+from dataset import BirdDataset,fetch_scheduler,AudioAug,BirdDatasetTwoLabel,BirdDatasetSplitTrain
+from torch.utils.data import Dataset,DataLoader,WeightedRandomSampler
 from torch import optim
-from model import BirdClefModel,BirdClefSEDModel,BirdClefSEDAttModel
+from model import BirdClefModel,BirdClefSEDModel,BirdClefSEDAttModel,BirdSetSEDModel
 from torch.cuda import amp  
 import time
 from tensorboardX import SummaryWriter
@@ -22,10 +30,11 @@ import sklearn
 from torchtoolbox.tools import mixup
 from torch.nn.functional import binary_cross_entropy_with_logits,binary_cross_entropy
 from utils import *
-from losses import SmoothBCEFocalLoss,MultiLoss
-import audiomentations as AA
+from losses import SmoothBCEFocalLoss,MultiLoss,MultiLossWeighting,BCELoss
+import  audiomentations as AA
 from torchtoolbox.tools import cutmix_data,MixingDataController
 import torch.nn.functional as F
+
 
 def get_logger(filename, verbosity=1, name=None):
     level_dict = {0: logging.DEBUG, 1: logging.INFO, 2: logging.WARNING}
@@ -61,9 +70,14 @@ def set_seed(seed = 42):
 set_seed(42)
 
 df_train = pd.read_csv(CFG.train_path)
-df_valid = pd.read_csv(CFG.valid_path)
+df_valid = pd.read_csv(CFG.train_path)
+df_valid = df_valid.sample(frac=0.1,random_state=42)
 
-df_train = pd.concat((df_train,df_valid))
+df_train['path'] = CFG.data_root+df_train['filename']
+df_valid['path'] = CFG.data_root+df_valid['filename']
+
+# external_train = pd.read_csv('/root/projects/BirdClef2025/data/external_train.csv')
+# df_train = pd.concat((df_train,external_train))
 
 df_train = pd.concat([df_train, pd.get_dummies(df_train['primary_label'])], axis=1)
 df_valid = pd.concat([df_valid, pd.get_dummies(df_valid['primary_label'])], axis=1)
@@ -74,8 +88,18 @@ non_missing_birds = list(set(list(df_train.primary_label.unique())).difference(m
 df_valid[missing_birds] = 0
 df_valid = df_valid[df_train.columns] ## Fix order
 
-df_train = upsample_data(df_train,thr=70)
-# df_train = downsample_data(df_train,thr=400)
+df_train = upsample_data(df_train,thr=50)
+
+# sample_weights = (
+#     df_train['primary_label'].value_counts() / 
+#     df_train['primary_label'].value_counts().sum()
+# )  ** (-0.5)
+# sample_weights_dict = dict(sample_weights)
+# sample_weights = df_train['primary_label'].map(lambda x:sample_weights_dict[x])
+# sampler = WeightedRandomSampler(sample_weights,num_samples=len(df_train))
+
+all_bgnoise = glob('/root/projects/BirdClef2025/externaldata/backgroundnoise/*/*')
+all_bgnoise.sort()
 
 wav_transform = Compose(
                 [
@@ -90,44 +114,35 @@ wav_transform = Compose(
                     AA.Shift(p=0.2),
                     RandomVolume(p=0.2),
                     # PitchShift(p=0.2),
-                    AddBackgroundNoise('/home/data/lijw/dataset/BirdCLEF-2021/train_soundscapes_nocall',min_snr_in_db=0,max_snr_in_db=3,p=0.25),
-                    AddBackgroundNoise('/home/data/lijw/dataset/f1010bird/ff1010bird_wav/wav_nocall',min_snr_in_db=0,max_snr_in_db=3,p=0.5),
+                    AA.AddBackgroundNoise(all_bgnoise,min_snr_db=3,max_snr_db=30,p=0.5),
+                    AA.Gain(min_gain_db=-12, max_gain_db=12, p=0.2),
                 ]
             )
-train_set = BirdDataset(df_train,sr = CFG.sample_rate,duration = CFG.duration,train = True,audio_augmentations=wav_transform)
-val_set = BirdDataset(df_valid,sr = CFG.sample_rate,duration = CFG.infer_duration,train = False)
-trainloader = DataLoader(train_set,batch_size=CFG.batch_size,shuffle=True,num_workers=16,pin_memory=True)
+train_set = BirdDatasetTwoLabel(df_train,sr = CFG.sample_rate,duration = CFG.duration,train = True,audio_augmentations=wav_transform)
+val_set = BirdDatasetTwoLabel(df_valid,sr = CFG.sample_rate,duration = CFG.infer_duration,train = False)
+trainloader = DataLoader(train_set,batch_size=CFG.batch_size,num_workers=16,pin_memory=True,shuffle=True)
 valloader = DataLoader(val_set,batch_size=CFG.batch_size,shuffle=False,num_workers=16,pin_memory=True)
 
 # loss
 # criterion = torch.nn.BCEWithLogitsLoss()
-criterion = nn.BCELoss()    
-loss_1 = MultiLoss(smoothing=CFG.smoothing_factor)
-loss_2 = MultiLoss(smoothing=0.)
+loss_ = BCELoss()
+# loss_ = MultiLossWeighting(smoothing=CFG.smoothing_factor)
 
 # model
-model = BirdClefSEDAttModel(CFG.model,num_classes=CFG.num_classes,pretrained=CFG.pretrained).cuda()
-model_dict = model.state_dict()
-pretrianed_dict = torch.load('/home/lijw/BirdCLEF/BirdCLEF-Baselinev2/logs/2023-05-19T02:07-efv2b3-pretrained/saved_model.pt')
-pretrianed_dict = {k:v for k,v in pretrianed_dict.items() if 'att_block' not in k}
-pretrianed_dict = {k:v for k,v in pretrianed_dict.items() if 'bn0' not in k}
-pretrianed_dict = {k:v for k,v in pretrianed_dict.items() if 'spectrogram_extractor' not in k}
-model_dict.update(pretrianed_dict)
-model.load_state_dict(pretrianed_dict,strict=False)
-
-teacher_model = BirdClefSEDAttModel(CFG.model,num_classes=CFG.num_classes,pretrained=CFG.pretrained).cuda()
-teacher_model.load_state_dict(torch.load('/home/lijw/BirdCLEF/BirdCLEF-Baselinev2/logs/2023-05-22T10:53-efv2b3-alldata-mel192/saved_model.pt'))
-teacher_model.eval()
+model = BirdSetSEDModel(num_classes=CFG.num_classes).cuda()
 
 # optimzer
-backbone_params = list(filter(lambda x: 'att_block' not in x[0],model.named_parameters())) # vit
-for ind, param in enumerate(backbone_params):
-    backbone_params[ind] = param[1]
-fc_params         = list(filter(lambda x: 'att_block' in x[0]*10,model.named_parameters())) # vit
-for ind, param in enumerate(fc_params):
-    fc_params[ind] = param[1]
-to_optim          = [{'params':backbone_params,'lr':CFG.lr},
-                        {'params':fc_params,'lr':CFG.lr*10}]
+if CFG.finetune_weight == True:
+    backbone_params = list(filter(lambda x: 'att_block' not in x[0],model.named_parameters())) # vit
+    for ind, param in enumerate(backbone_params):
+        backbone_params[ind] = param[1]
+    fc_params         = list(filter(lambda x: 'att_block' in x[0],model.named_parameters())) # vit
+    for ind, param in enumerate(fc_params):
+        fc_params[ind] = param[1]
+    to_optim          = [{'params':backbone_params,'lr':CFG.lr},
+                            {'params':fc_params,'lr':CFG.lr*10}]
+else:
+    to_optim = model.parameters()
 
 optimizer = optim.Adam(to_optim,lr=CFG.lr)
 scheduler = fetch_scheduler(optimizer,len(trainloader))
@@ -137,8 +152,8 @@ mixup_clef = Mixup(mix_beta=1)
 
 best_cmAP = -np.inf
 current_time = time.strftime("%Y-%m-%dT%H:%M", time.localtime())
-my_writer = SummaryWriter(log_dir='/home/lijw/BirdCLEF/BirdCLEF-Baselinev2/logs/'+current_time)
-logger = get_logger('/home/lijw/BirdCLEF/BirdCLEF-Baselinev2/logs/'+current_time+'/training.log')
+my_writer = SummaryWriter(log_dir=CFG.log_dir+current_time)
+logger = get_logger(CFG.log_dir+current_time+'/training.log')
 logger.info('the hyperparameters of the network is:')
 for k, v in dict(vars(CFG)).items():
     if '__' not in k:
@@ -146,32 +161,24 @@ for k, v in dict(vars(CFG)).items():
 for i in range(CFG.epochs):
     model.train()
     scaler = amp.GradScaler()
-    for idx,(audios,labels) in enumerate(trainloader):
+    for idx,(audios,labels,weights) in enumerate(trainloader):
         audios = audios.to(torch.float32).to(CFG.device)
         labels = labels.to(CFG.device)
+        weights = weights.to(CFG.device)
         images = model.get_mel_gram(audios)
         images = torch.repeat_interleave(images.unsqueeze(1),repeats=3,dim=1)
 
-        data_label_list = cutmix_aug.get_data(images,labels)
-        images = data_label_list[0]
-        # with torch.no_grad():
-        #     pesudo_label = teacher_model.forward(images)
-        #     pesudo_label = (pesudo_label['clipwise_output'] + pesudo_label['maxframewise_output'])/2
-        #     pesudo_label = pesudo_label.detach()
-        #     pesudo_label[pesudo_label<0.3] = 0.
-        #     pesudo_label[pesudo_label>0.6] = 0.95
+        data_label_list = mixup_data(images,labels)
         with amp.autocast(enabled=True):
             if data_label_list[-1]:
+                images = data_label_list[0]
                 pred = model(images)
                 label_a,label_b = data_label_list[1],data_label_list[2]
-                loss1 = mixup_criterion(loss_1,pred,label_a,label_b,data_label_list[3])
-                # loss2 = loss_2(pred,pesudo_label)
-                loss = loss1
+                loss = mixup_criterion(loss_,pred,label_a,label_b,data_label_list[3],classes_weight=weights)
             else:
+                images = data_label_list[0]
                 pred = model(images)
-                loss1 = loss_1(pred,data_label_list[1])
-                # loss2 = loss_2(pred,pesudo_label)
-                loss = loss1 
+                loss = loss_(pred,data_label_list[1],weights=weights)
             loss = loss/CFG.n_accumulate
 
         scaler.scale(loss).backward()
@@ -192,7 +199,7 @@ for i in range(CFG.epochs):
     logger.info('start valid...')
     predall_tensor = torch.zeros(0).to(CFG.device)
     gtall_tensor = torch.zeros(0).to(CFG.device)
-    for idx,(audios,labels) in enumerate(valloader):
+    for idx,(audios,labels,weights) in enumerate(valloader):
         audios = audios.to(torch.float32).to(CFG.device)
         labels = labels.to(torch.long).to(CFG.device)
 
@@ -212,18 +219,19 @@ for i in range(CFG.epochs):
     # cmAP_pad3_score = padded_cmap(gt_df, pred_df, padding_factor = 3)
     cmAP_pad5_score,cmAP_pad5_score_ = padded_cmap(gt_df, pred_df, padding_factor = 5)
     AP_score = sklearn.metrics.label_ranking_average_precision_score(np.int16(gtall_numpy),predall_numpy)
+    scored_gt = gtall_numpy[:,np.where(gtall_numpy.sum(axis=0)!=0)[0]]
+    scored_pred = predall_numpy[:,np.where(gtall_numpy.sum(axis=0)!=0)[0]]
+    macro_auc = sklearn.metrics.roc_auc_score(np.int16(scored_gt),scored_pred,)
 
-    logging.info('epoch:[{}/{}]  cmAP:{:.4f} AP:{:.4f}'.format(i,CFG.epochs,cmAP_pad5_score,AP_score))
+    logging.info('epoch:[{}/{}]  cmAP:{:.4f} AP:{:.4f} AUC:{:.4f}'.format(i,CFG.epochs,cmAP_pad5_score,AP_score,macro_auc))
 
     if cmAP_pad5_score> best_cmAP:
         last_best_cmAP = best_cmAP
         best_cmAP = cmAP_pad5_score.copy()
         logger.info(f'epoch:{i} val_cmAP improved from {last_best_cmAP} to {best_cmAP}')
-        torch.save(model.state_dict(),'/home/lijw/BirdCLEF/BirdCLEF-Baselinev2/logs/'+current_time+'/saved_model.pt')
+        torch.save(model.state_dict(),CFG.log_dir+current_time+'/saved_model.pt')
     else:
         logger.info(f'epoch:{i} val_cmAP did not improved from {best_cmAP}, now val_cmAP is {cmAP_pad5_score}...')
-    # if i>30:
-    #     torch.save(model.state_dict(),'/home/lijw/BirdCLEF/BirdCLEF-Baselinev2/logs/'+current_time+'/saved_model_epoch'+str(i)+'.pt')
-torch.save(model.state_dict(),'/home/lijw/BirdCLEF/BirdCLEF-Baselinev2/logs/'+current_time+'/saved_model_lastepoch.pt')
+torch.save(model.state_dict(),CFG.log_dir+current_time+'/saved_model_lastepoch.pt')
 
         

@@ -7,6 +7,7 @@ import numpy as np
 from tqdm import tqdm
 import re
 from glob import glob
+from tqdm import tqdm
 
 def urldownload(url,filename=None):
     """
@@ -15,7 +16,7 @@ def urldownload(url,filename=None):
     :param filename: 要存放的目录及文件名，例如：./test.xls
     :return:
     """
-    resp = requests.get(url, stream=True,timeout=5)
+    resp = requests.get(url, stream=True,timeout=10)
     # 拿到文件的长度，并把total初始化为0
     total = int(resp.headers.get('content-length', 0))
     with open(filename, 'wb') as file, tqdm(
@@ -36,44 +37,41 @@ value_list = list(df['primary_label'].value_counts())
 
 LowNumName = []
 for i in range(len(value_list)):
-    if value_list[i]<500:
+    if value_list[i]<50:
         LowNumName.append(name_list[i])
 
-eBirdName = []
+eBirdNames = []
 for i in range(len(LowNumName)):
     nameTemp = df[df['primary_label'] == LowNumName[i]]['scientific_name'].unique().item()
     nameTemp = nameTemp.replace(' ','-')
-    eBirdName.append(nameTemp)
+    eBirdNames.append(nameTemp)
 
-plist = []
-res = requests.get('https://xeno-canto.org/collection/species/all')
-content = BeautifulSoup(res.text,"html.parser")
-datas = content.find_all(href=re.compile("species"))
-for data in datas:
-    http_temp = data.get('href')
-    plist.append(http_temp)
-
-filteredPlist = []
-for i in eBirdName:
-    for j in plist:
-        if i in j:
-            filteredPlist.append(j)
-
+df['single_filename'] = df['filename'].map(lambda x:x.split('/')[1].replace('.ogg',''))
 download_dict = {}
-for i in filteredPlist:
-    name = i.split('/')[-1]
-    resTemp = requests.get(i)
-    contentTemp = BeautifulSoup(resTemp.text,"html.parser")
-    datasTemp = contentTemp.find_all(href=re.compile("/download"))
+all_url_list = []
+for idx,eBirdName in tqdm(enumerate(eBirdNames),total=len(eBirdNames)):
+    name = LowNumName[idx]
+    res = requests.get(f'https://xeno-canto.org/species/{eBirdName}')
+    content = BeautifulSoup(res.text,"html.parser")
+    datasTemp = content.find_all(href=re.compile("/download"))
     http_list = []
     for data in datasTemp:
-        http_list.append(data.get('href'))
+        thisfilename = datasTemp[0].contents[0].attrs['title'].split('Download file')[1].split(' - ')[0].replace(' \'','')
+        # if thisfilename not in list(df['single_filename']):
+        if data.get('href').replace('/download','') not in list(df['url']):
+            http_list.append(data.get('href'))
+            all_url_list.append(data)
     download_dict[name] = http_list.copy()
 
-targetPath = '/root/projects/BirdClef2025/externaldata/downloadAudios/'
-for key,value in download_dict.items():
+error_list = []
+targetPath = '/root/projects/BirdClef2025/externaldata/download_xc_data/'
+for key,value in tqdm(download_dict.items(),total=len(download_dict)):
     for url in value:
         nameTemp = url.split('/')[-2]
         if not os.path.exists(targetPath+key):
             os.mkdir(targetPath+key)
-        urldownload(url,targetPath+key+'/XC'+nameTemp+'.ogg')
+        try:
+            urldownload(url,targetPath+key+'/XC'+nameTemp+'.ogg')
+        except:
+            error_list.append(url)
+print(error_list)

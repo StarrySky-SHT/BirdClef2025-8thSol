@@ -2,3 +2,6 @@
 /.vscode
 /__pycache__
 /usefulFunc/*.csv
+/usefulFunc/*.xml
+/usefulFunc/*.bin
+/usefulFunc/*.onnx

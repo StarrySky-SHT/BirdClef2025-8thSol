@@ -1,3 +1,8 @@
+import os
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+import sys
+sys.path.append('/root/projects/BirdClef2025/BirdCLEF2023-30th-place-solution-master/')
+
 from email.mime import audio
 import torch
 import pandas as pd
@@ -5,9 +10,6 @@ import numpy as np
 from glob import glob
 import logging
 import random
-import os
-import sys
-sys.path.append('/home/lijw/BirdCLEF/BirdCLEF-Baselinev2')
 from config import CFG  
 import albumentations as A
 from dataset import BirdDataset,fetch_scheduler,AudioAug
@@ -61,7 +63,7 @@ def set_seed(seed = 42):
 set_seed(42)
 
 df_train = pd.read_csv(CFG.train_path)
-df_valid = pd.read_csv(CFG.valid_path)
+df_valid = pd.read_csv(CFG.train_path)
 
 bird2021_df = pd.read_csv('/root/projects/BirdClef2025/externaldata/birdclef-2021/train_metadata.csv')
 bird2022_df = pd.read_csv('/root/projects/BirdClef2025/externaldata/birdclef-2022/train_metadata.csv')

@@ -26,6 +26,25 @@ from audiomentations.core.utils import (
 import torch.nn.functional as F
 from tqdm import tqdm
 
+def sumix(waves: torch.Tensor, labels: torch.Tensor, max_percent: float = 1.0, min_percent: float = 0.3):
+    batch_size = len(labels)
+    perm = torch.randperm(batch_size)
+    coeffs_1 = torch.rand(batch_size, device=waves.device).view(-1, 1) * (
+        max_percent  - min_percent
+    ) + min_percent
+    coeffs_2 = torch.rand(batch_size, device=waves.device).view(-1, 1) * (
+        max_percent  - min_percent
+    ) + min_percent
+    label_coeffs_1 = torch.where(coeffs_1 >= 0.5, 1, 1 - 2 * (0.5 - coeffs_1))
+    label_coeffs_2 = torch.where(coeffs_2 >= 0.5, 1, 1 - 2 * (0.5 - coeffs_2))
+    labels = label_coeffs_1 * labels + label_coeffs_2 * labels[perm]
+
+    waves = coeffs_1 * waves + coeffs_2 * waves[perm]
+    return {
+        "waves": waves,
+        "labels": torch.clip(labels, 0, 1)
+    }
+
 def random_power(images, power = 1.5, c= 0.7):
     images = images - images.min()
     images = images/(images.max()+0.0000001)
@@ -354,13 +373,18 @@ def instance_mixup(x,alpha=0.2,use_instance_mixup=False,instance_mixup_pro=0.5):
         mixed_x = torch.cat(torch.chunk(x,chunks=4,dim=2),dim=2)
     return mixed_x
 
-def mixup_data(x, y, alpha=0.2):
+def mixup_data(x, y, alpha=0.2,use_mixup=True):
     """Returns mixed inputs, pairs of targets, and lambda
     """
-    if alpha > 0:
-        lam = np.random.beta(alpha, alpha)
+    if not use_mixup:
+        return x,y,0
+    if np.random.uniform(0,1)<0.5:
+        if alpha > 0:
+            lam = np.random.beta(alpha, alpha)
+        else:
+            lam = 1
     else:
-        lam = 1
+        return x,y,0
 
     mixed_x = lam * x + (1 - lam) * x.flip(dims=(0, ))
     y_a, y_b = y, y.flip(dims=(0, ))
@@ -387,6 +411,43 @@ SUPPORTED_EXTENSIONS = (
 ".npy"
 )
 
+def sample_one_per_group(df: pd.DataFrame, group_column: str) -> tuple:
+    """
+    从指定列的每个类别中随机抽样1个元素，并合并成新的 DataFrame
+    如果某个类别只有一个元素，则不进行抽样
+    返回一个元组，包含：
+    1. 抽样结果的 DataFrame
+    2. 从原始 DataFrame 中删除了抽样结果后的新 DataFrame
+    :param df: 原始 DataFrame
+    :param group_column: 按此列进行分组的列名
+    :return: tuple (抽样结果的 DataFrame, 删除抽样结果后的原始 DataFrame)
+    """
+    # 按指定列进行分组
+    grouped = df.groupby(group_column)
+  
+    # 对每个组进行抽样，如果组内元素数量大于1，则抽样1个；否则不抽样
+    sampled_dfs = []
+    sampled_indices = []  # 用于记录抽样的索引
+  
+    for name, group in grouped:
+        if len(group) > 1:
+            sample = group.sample(n=1)
+            sampled_dfs.append(sample)
+            sampled_indices.extend(sample.index.tolist())  # 记录抽样的行索引
+  
+    # 合并所有抽样结果
+    if sampled_dfs:
+        result_df = pd.concat(sampled_dfs, ignore_index=True)
+    else:
+        result_df = pd.DataFrame()  # 如果没有符合条件的抽样结果，返回空 DataFrame
+  
+    # 从原始 DataFrame 中删除抽样结果
+    if sampled_indices:
+        remaining_df = df.drop(sampled_indices)
+    else:
+        remaining_df = df.copy()  # 如果没有抽样结果，返回原始 DataFrame 的副本
+  
+    return result_df, remaining_df
 
 def find_audio_files(
     root_path,
