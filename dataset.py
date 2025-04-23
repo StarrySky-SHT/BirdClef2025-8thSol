@@ -7,6 +7,7 @@ import soundfile as sf
 import audiomentations as AA
 from utils import upsample_data,downsample_data,sumix
 import pandas as pd
+import pickle
 
 # Generates random integer
 def random_int(minval=0, maxval=1):
@@ -139,6 +140,8 @@ class BirdDatasetTwoLabel(torch.utils.data.Dataset):
         self.use_mixup = CFG.use_mixup
         self.audio_augmentations = audio_augmentations
         self.bird_cols = bird_cols
+        with open('/root/projects/BirdClef2025/data/train_voice_data_numpy.pkl','rb') as f:
+            self.hv_record = pickle.load(f)
 
     def __len__(self):
         return len(self.df)
@@ -158,14 +161,30 @@ class BirdDatasetTwoLabel(torch.utils.data.Dataset):
             x = (x-x.min())/(x.max()-x.min())
         return x
 
+    def crop_or_pa_o(self,y, length, is_train=True, start=None):
+        len_y = len(y)
+        effective_length = self.duration * self.sr
+        if len_y < effective_length:
+            new_y = y.copy()
+            while len(new_y) < effective_length:
+                new_y = np.concatenate((new_y,y))
+            y = new_y[0:effective_length]
+        elif len_y > effective_length:
+            start = np.random.randint(len_y - effective_length)
+            y = y[start:start + effective_length].astype(np.float32)
+        else:
+            y = y.astype(np.float32)
+
+        return y
+    
     def crop_or_pad(self,y, length, is_train=True, start=None):
         len_y = len(y)
         effective_length = self.duration * self.sr
         if len_y < effective_length:
-            new_y = np.ones(effective_length, dtype=y.dtype)*1e-9
-            start = np.random.randint(effective_length - len_y)
-            new_y[start:start + len_y] = y
-            y = new_y.astype(np.float32)
+            new_y = y.copy()
+            while len(new_y) < effective_length:
+                new_y = np.concatenate((new_y,y))
+            y = new_y[0:effective_length]
         elif len_y > effective_length:
             start = np.random.randint(len_y - effective_length)
             y = y[start:start + effective_length].astype(np.float32)
@@ -178,10 +197,10 @@ class BirdDatasetTwoLabel(torch.utils.data.Dataset):
         len_y = len(y)
         effective_length = self.duration * self.sr
         if len_y < effective_length:
-            new_y = np.ones(effective_length, dtype=y.dtype)*1e-9
-            start = np.random.randint(effective_length - len_y)
-            new_y[start:start + len_y] = y
-            y = new_y.astype(np.float32)
+            new_y = y.copy()
+            while len(new_y) < effective_length:
+                new_y = np.concatenate((new_y,y))
+            y = new_y[0:effective_length]
         elif len_y > effective_length:
             start = 0
             y = y[start:start + effective_length].astype(np.float32)
@@ -193,6 +212,11 @@ class BirdDatasetTwoLabel(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx].copy()
         audio,orig_sr = sf.read(row['path'].replace('.mp3','.ogg'))
+        ogg_name = row['path'].split('/')[-1]
+        if ogg_name in self.hv_record:
+            delete_index = self.hv_record[ogg_name]
+            delete_index = delete_index[np.where(delete_index<len(audio))]
+            audio = np.delete(audio,delete_index)
         if len(audio.shape)==2:
             audio = audio[:,0]
         if orig_sr!=self.sr:
@@ -202,7 +226,7 @@ class BirdDatasetTwoLabel(torch.utils.data.Dataset):
             if row['secondary_labels'] != "['']" and row['secondary_labels'] != '[]' and type(row['secondary_labels']) != float:
                 labellist = row['secondary_labels'].replace('[','').replace(']','').replace('\'','').split(', ')
                 for j in labellist:
-                    row[j] = 0.995
+                    row[j] = 1.0
             audio = self.crop_or_pad(audio,self.audio_length,self.train) # constant length (l,) array
             if self.audio_augmentations:
                 audio = self.audio_augmentations(audio)
@@ -217,6 +241,11 @@ class BirdDatasetTwoLabel(torch.utils.data.Dataset):
                 weight = 1
             # weight = None
         else:
+            if row['secondary_labels'] != "['']" and row['secondary_labels'] != '[]' and type(row['secondary_labels']) != float:
+                labellist = row['secondary_labels'].replace('[','').replace(']','').replace('\'','').split(', ')
+                for j in labellist:
+                    row[j] = 1.0
+
             audio = self.get_first_duration(audio)
             if row['rating']!=0:
                 if np.isnan(row['rating']):
@@ -270,12 +299,27 @@ class BirdDatasetSplitTrain(BirdDatasetTwoLabel):
 
 
 class BirdDatasetWithPseudoLabel(BirdDatasetTwoLabel):
-    def __init__(self, df, bird_cols=None, sr=CFG.sample_rate, duration=CFG.duration, audio_augmentations=None, train=True):
+    def __init__(self, df, pesudo_df = None, bird_cols=None, sr=CFG.sample_rate, duration=CFG.duration, audio_augmentations=None, train=True):
         super().__init__(df, bird_cols, sr, duration, audio_augmentations, train)
+        self.pseudo_df = pesudo_df
     
+    def __add_noise(self, tgt_wav, add_wav, db):
+        tgt_rms = np.sqrt(np.mean(np.square(tgt_wav), axis=-1))
+        add_rms = np.sqrt(np.mean(np.square(add_wav), axis=-1))
+
+        noise_rms = tgt_rms / (10**(float(db) / 20)) 
+        new_wav = tgt_wav + add_wav * (noise_rms / (add_rms + 1e-6))
+        new_wav = np.clip(new_wav, np.min(new_wav)*2, np.max(new_wav)*2)
+        return new_wav
+
     def __getitem__(self, idx):
         row = self.df.iloc[idx].copy()
         audio,orig_sr = sf.read(row['path'].replace('.mp3','.ogg'))
+        ogg_name = row['path'].split('/')[-1]
+        if ogg_name in self.hv_record:
+            delete_index = self.hv_record[ogg_name]
+            delete_index = delete_index[np.where(delete_index<len(audio))]
+            audio = np.delete(audio,delete_index)
         if len(audio.shape)==2:
             audio = audio[:,0]
         if orig_sr!=self.sr:
@@ -285,14 +329,47 @@ class BirdDatasetWithPseudoLabel(BirdDatasetTwoLabel):
             if row['secondary_labels'] != "['']" and row['secondary_labels'] != '[]' and type(row['secondary_labels']) != float:
                 labellist = row['secondary_labels'].replace('[','').replace(']','').replace('\'','').split(', ')
                 for j in labellist:
-                    row[j] = 0.995
+                    row[j] = 1.0
             audio = self.crop_or_pad(audio,self.audio_length,self.train) # constant length (l,) array
             if self.audio_augmentations:
                 audio = self.audio_augmentations(audio)
+            if row['rating']!=0:
+                if np.isnan(row['rating']):
+                    weight = 1
+                elif type(row['rating'])==np.dtype(np.float64):
+                    weight = row['rating']/5
+                else:
+                    weight = 1
+            else:
+                weight = 1
+            # weight = None
         else:
             audio = self.get_first_duration(audio)
-        weight = 0 if self.df.iloc[idx]['is_pesudo'] else 1
-        return torch.from_numpy(audio),torch.tensor(row[self.bird_cols]).float(),torch.tensor(weight).float()
+            if row['rating']!=0:
+                if np.isnan(row['rating']):
+                    weight = 1
+                elif type(row['rating'])==np.dtype(np.float64):
+                    weight = row['rating']/5
+                else:
+                    weight = 1
+            else:
+                weight = 1
+        
+        if np.random.uniform(0,1) < 0.5:
+            random_idx = np.random.randint(0,len(self.pseudo_df))
+            pesudo_file = self.pseudo_df.iloc[random_idx]['path']
+            pesudo_label = self.pseudo_df.iloc[random_idx][self.bird_cols]
+            pesudo_audio,_ = sf.read(pesudo_file)
+            db = np.random.uniform(20,40)
+            audio = self.__add_noise(pesudo_audio,audio,db)
+            label = np.array(row[self.bird_cols]) + np.array(pesudo_label)
+            label = label.astype(np.float32)
+            label = np.clip(label,0,1)
+            audio,label,weights = torch.from_numpy(audio),torch.from_numpy(label).float(),torch.tensor(weight).float()
+        else:
+            label = np.array(row[self.bird_cols]).astype(np.float32)
+            audio,label,weights = torch.from_numpy(audio),torch.from_numpy(label).float(),torch.tensor(weight).float()
+        return audio,label,weights
 
 def fetch_scheduler(optimizer,steps_per_epoch,epochs=CFG.epochs):
     if CFG.scheduler == 'CosineAnnealingLR':
@@ -324,9 +401,9 @@ if __name__ == '__main__':
     df = upsample_data(df,thr=50)
     df = downsample_data(df,thr=400)
 
-    pesudo_df = pd.read_csv('/root/projects/BirdClef2025/BirdCLEF2023-30th-place-solution-master/usefulFunc/pesudo_label_0.5.csv')
-    pesudo_df['path'] = '/root/projects/BirdClef2025/data/train_soundscapes_20s/'+pesudo_df['filename']
+    pesudo_df = pd.read_csv('/root/projects/BirdClef2025/BirdCLEF2023-30th-place-solution-master/usefulFunc/pesudo_labelv12_ensemble.csv')
+    birds_cols = list(pd.get_dummies(df['primary_label']).columns)
 
-    dataset = BirdDatasetWithPseudoLabel(df, pesudo_df, sr=CFG.sample_rate, duration=CFG.duration, train=True)
-    data1 = dataset.__getitem__(300)
+    dataset = BirdDatasetWithPseudoLabel(df, pesudo_df, birds_cols, sr=CFG.sample_rate, duration=CFG.duration, train=True)
+    data1 = dataset.__getitem__(10)
     print(1)

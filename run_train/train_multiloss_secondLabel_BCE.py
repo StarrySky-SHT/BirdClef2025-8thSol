@@ -1,7 +1,7 @@
 import os
 
 import torch.utils
-os.environ['CUDA_VISIBLE_DEVICES'] = '2'
+os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 import sys
@@ -20,7 +20,7 @@ import albumentations as A
 from dataset import BirdDataset,fetch_scheduler,AudioAug,BirdDatasetTwoLabel,BirdDatasetSplitTrain
 from torch.utils.data import Dataset,DataLoader,WeightedRandomSampler
 from torch import optim
-from model import BirdClefModel,BirdClefSEDModel,BirdClefSEDAttModel
+from model import BirdClefSEDAttModel
 from torch.cuda import amp  
 import time
 from tensorboardX import SummaryWriter
@@ -34,6 +34,7 @@ from losses import SmoothBCEFocalLoss,MultiLoss,MultiLossWeighting,BCELoss
 import  audiomentations as AA
 from torchtoolbox.tools import cutmix_data,MixingDataController
 import torch.nn.functional as F
+import torchvision.transforms as A
 
 
 def get_logger(filename, verbosity=1, name=None):
@@ -113,15 +114,16 @@ wav_transform = Compose(
                             GaussianNoise(p=1, min_snr=5, max_snr=20),
                             PinkNoise(p=1, min_snr=5, max_snr=20)
                         ],
-                        p=0.5,
+                        p=0.1,
                     ),
-                    AA.Shift(p=0.2),
-                    RandomVolume(p=0.2),
+                    AA.Shift(p=0.1),
+                    RandomVolume(p=0.1),
                     # PitchShift(p=0.2),
-                    AA.AddBackgroundNoise(all_bgnoise,min_snr_db=3,max_snr_db=30,p=0.5),
-                    AA.Gain(min_gain_db=-12, max_gain_db=12, p=0.2),
+                    AA.AddBackgroundNoise(all_bgnoise,min_snr_db=3,max_snr_db=30,p=0.1),
+                    AA.Gain(min_gain_db=-12, max_gain_db=12, p=0.1),
                 ]
             )
+
 train_set = BirdDatasetTwoLabel(df_train,bird_cols=birds,sr = CFG.sample_rate,duration = CFG.duration,train = True,audio_augmentations=wav_transform)
 val_set = BirdDatasetTwoLabel(df_valid,bird_cols=birds,sr = CFG.sample_rate,duration = CFG.infer_duration,train = False)
 trainloader = DataLoader(train_set,batch_size=CFG.batch_size,num_workers=16,pin_memory=True,shuffle=True)
@@ -137,13 +139,13 @@ model = BirdClefSEDAttModel(CFG.model,num_classes=CFG.num_classes,pretrained=CFG
 
 # optimzer
 if CFG.finetune_weight == True:
-    model_dict = model.state_dict()
-    pretrianed_dict = torch.load('/root/projects/BirdClef2025/BirdCLEF2023-30th-place-solution-master/logs/2025-03-19T16:33-pretrain/saved_model_lastepoch.pt')
-    pretrianed_dict = {k:v for k,v in pretrianed_dict.items() if 'att_block' not in k}
-    pretrianed_dict = {k:v for k,v in pretrianed_dict.items() if 'bn0' not in k}
-    pretrianed_dict = {k:v for k,v in pretrianed_dict.items() if 'spectrogram_extractor' not in k}
-    model_dict.update(pretrianed_dict)
-    model.load_state_dict(pretrianed_dict,strict=False)
+    pretrianed_dict = torch.load('/root/projects/BirdClef2025/BirdCLEF2023-30th-place-solution-master/logs/2025-03-19T16:33-pretrain-efv2b3Pretrain/saved_model_lastepoch.pt')
+    to_load_dict = dict()
+    for k,v in pretrianed_dict.items():
+        if 'backbone' in k or 'fc1' in k:
+            to_load_dict[k] = v
+    model.load_state_dict(to_load_dict,strict=False)
+
     backbone_params = list(filter(lambda x: 'att_block' not in x[0],model.named_parameters())) # vit
     for ind, param in enumerate(backbone_params):
         backbone_params[ind] = param[1]

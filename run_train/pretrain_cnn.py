@@ -1,5 +1,6 @@
 import os
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+os.environ['CUDA_VISIBLE_DEVICES'] = "1"
 import sys
 sys.path.append('/root/projects/BirdClef2025/BirdCLEF2023-30th-place-solution-master/')
 
@@ -15,7 +16,7 @@ import albumentations as A
 from dataset import BirdDataset,fetch_scheduler,AudioAug
 from torch.utils.data import Dataset,DataLoader
 from torch import optim
-from model import BirdClefModel,BirdClefSEDAttModel
+from model import BirdClefCNNModel,BirdClefSEDAttModel,BirdClefCNNFCModel
 from torch.cuda import amp  
 import time
 from tensorboardX import SummaryWriter
@@ -24,7 +25,7 @@ from metrics import padded_cmap,map_score
 import sklearn
 from torchtoolbox.tools import mixup_criterion,mixup_data
 from torch.nn.functional import binary_cross_entropy_with_logits
-from losses import SmoothBCEFocalLoss,MultiLoss
+from losses import SmoothBCEFocalLoss,MultiLoss,BCECNNLoss
 from utils import *
 import  audiomentations as AA
 from torchtoolbox.tools import cutmix_data,MixingDataController
@@ -111,8 +112,8 @@ df_valid = df_valid[df_train.columns] ## Fix order
 df_train = df_train[~df_train.filename.isin(df_valid.filename)]
 
 # df_train = upsample_data(df_train,thr=50)
+CFG.lr = 1e-4
 CFG.num_classes = len(birds)
-CFG.batch_size = 96
 CFG.duration = 7
 
 all_bgnoise = glob('/root/projects/BirdClef2025/externaldata/backgroundnoise/*/*')
@@ -142,11 +143,13 @@ valloader = DataLoader(val_set,batch_size=CFG.batch_size,shuffle=False,num_worke
 
 # loss
 # criterion = torch.nn.BCEWithLogitsLoss()
-criterion = nn.BCELoss()    
-loss_ = SmoothBCEFocalLoss(smoothing=0.)
+# loss
+# criterion = torch.nn.BCEWithLogitsLoss()
+loss_ = BCECNNLoss()
+# loss_ = MultiLossWeighting(smoothing=CFG.smoothing_factor)
 
 # model
-model = BirdClefSEDAttModel(CFG.model,num_classes=CFG.num_classes,pretrained=CFG.pretrained).cuda()
+model = BirdClefCNNFCModel(CFG.model,num_classes=CFG.num_classes,pretrained=CFG.pretrained).cuda()
 # model_dict = model.state_dict()
 # pretrianed_dict = torch.load('/home/lijw/BirdCLEF/BirdCLEF-Baselinev2/logs/2023-04-23T10:18-efv2b1-mel224-pretrained/saved_model_lastepoch.pt')
 # pretrianed_dict = {k:v for k,v in pretrianed_dict.items() if 'att_block' not in k}
@@ -192,13 +195,12 @@ for i in range(CFG.epochs):
                 images = data_label_list[0]
                 pred = model(images)
                 label_a,label_b = data_label_list[1],data_label_list[2]
-                loss = mixup_criterion(loss_,pred['clipwise_output'],label_a,label_b,data_label_list[3])
+                loss = mixup_criterion(loss_,pred,label_a,label_b,data_label_list[3])
             else:
                 images = data_label_list[0]
                 pred = model(images)
-                loss = loss_(pred['clipwise_output'],data_label_list[1])
+                loss = loss_(pred,data_label_list[1])
             loss = loss/CFG.n_accumulate
-
         scaler.scale(loss).backward()
         
         if (idx + 1) % CFG.n_accumulate == 0:

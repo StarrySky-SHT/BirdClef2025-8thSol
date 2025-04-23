@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision
 
 def pdist(e, squared=False, eps=1e-12):
     e_square = e.pow(2).sum(dim=1)
@@ -31,15 +32,34 @@ class SmoothBCEFocalLoss(nn.Module):
                            (1-targets)*torch.log(1-input)*weights*(input**2),dim=(0,1))
         return loss
 
-class MLDLoss(nn.Module):
-    def __init__(self):
+class FocalLossBCE(torch.nn.Module):
+    def __init__(
+            self,
+            alpha: float = 0.25,
+            gamma: float = 2,
+            reduction: str = "mean",
+            bce_weight: float = 1.0,
+            focal_weight: float = 1.0,
+    ):
         super().__init__()
-        self.kl_div_loss = torch.nn.KLDivLoss(reduction="none")
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        self.bce = torch.nn.BCEWithLogitsLoss(reduction=reduction)
+        self.bce_weight = bce_weight
+        self.focal_weight = focal_weight
 
-    def forward(self,prob_teacher,prob_student):
-        loss = self.kl_div_loss(torch.log(prob_student), prob_teacher) + self.kl_div_loss(torch.log(1 - prob_student), 1 - prob_teacher)
-        loss = loss.mean()
-        return loss
+    def forward(self, logits, targets, weights=None):
+        focall_loss = torchvision.ops.focal_loss.sigmoid_focal_loss(
+            inputs=logits,
+            targets=targets,
+            alpha=self.alpha,
+            gamma=self.gamma,
+            reduction=self.reduction,
+        )
+        bce_loss = self.bce(logits, targets)
+        return self.bce_weight * bce_loss + self.focal_weight * focall_loss
+
     
 class BCELoss(nn.Module):
     def __init__(self) -> None:
@@ -51,29 +71,22 @@ class BCELoss(nn.Module):
         input1 = torch.clamp(input['clipwise_output'],1e-3,0.999)
         input2 = torch.clamp(input['maxframewise_output'],1e-3,0.999)
 
-        # targets_mask = (targets != 0.5) 
-
         loss1 = -torch.mean(targets*torch.log(input1) + 
-                           (1-targets)*torch.log(1-input1),dim=1)
+                           (1-targets)*torch.log(1-input1),dim=(0,1))
 
         loss2 = -torch.mean(targets*torch.log(input2) + 
-                           (1-targets)*torch.log(1-input2),dim=1)
-        if weights.sum() == 0:
-            return 0.001*(loss1 + loss2)
-        loss1 = torch.mean(loss1[torch.where(weights)])
-        loss2 = torch.mean(loss2[torch.where(weights)])
-
-        # loss1 = -(targets*torch.log(input1) + 
-        #                    (1-targets)*torch.log(1-input1))
-
-        # loss2 = -(targets*torch.log(input2) + 
-        #                    (1-targets)*torch.log(1-input2))
-        
-        # loss1 = torch.sum(loss1*targets_mask)/torch.sum(targets_mask)
-        # loss2 = torch.sum(loss2*targets_mask)/torch.sum(targets_mask)
+                           (1-targets)*torch.log(1-input2),dim=(0,1))
 
         loss = loss1 + loss2
         return loss
+
+class BCECNNLoss(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.loss = torch.nn.BCEWithLogitsLoss()
+
+    def forward(self,input,targets,weights=None):
+        return self.loss(input,targets)
 
 class Splitloss(nn.Module):
     def __init__(self,split1,split2,device='cuda',focal_weight = 2) -> None:
@@ -294,6 +307,17 @@ class RkdDistance(nn.Module):
 
         loss = F.smooth_l1_loss(d, t_d, reduction='elementwise_mean')
         return loss
+
+class MLDLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.kl_loss = nn.KLDivLoss(reduction='none')
+    
+    def forward(self,target,probs):
+        probs = torch.clamp(probs,1e-3,0.999)
+        target = torch.clamp(target,1e-3,0.999)
+        loss = self.kl_loss(torch.log(probs),target) + self.kl_loss(torch.log(1-probs),1-target)
+        return loss.mean()
 
 if __name__ == '__main__':
     # loss = BCELoss()

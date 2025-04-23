@@ -373,12 +373,12 @@ def instance_mixup(x,alpha=0.2,use_instance_mixup=False,instance_mixup_pro=0.5):
         mixed_x = torch.cat(torch.chunk(x,chunks=4,dim=2),dim=2)
     return mixed_x
 
-def mixup_data(x, y, alpha=0.2,use_mixup=True):
+def mixup_data(x, y, alpha=0.5,use_mixup=True):
     """Returns mixed inputs, pairs of targets, and lambda
     """
     if not use_mixup:
         return x,y,0
-    if np.random.uniform(0,1)<0.5:
+    if np.random.uniform(0,1)<=1.0:
         if alpha > 0:
             lam = np.random.beta(alpha, alpha)
         else:

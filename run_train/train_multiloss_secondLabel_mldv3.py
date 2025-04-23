@@ -1,7 +1,7 @@
 import os
 
 import torch.utils
-os.environ['CUDA_VISIBLE_DEVICES'] = '2'
+os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 import sys
@@ -80,7 +80,7 @@ df_valid['path'] = CFG.data_root+df_valid['filename']
 
 # external_train = pd.read_csv('/root/projects/BirdClef2025/data/external_train.csv')
 # df_train = pd.concat((df_train,external_train))
-pesudo_df = pd.read_csv('/root/projects/BirdClef2025/BirdCLEF2023-30th-place-solution-master/usefulFunc/pesudo_labelv14_ensemble.csv')
+pesudo_df = pd.read_csv('/root/projects/BirdClef2025/BirdCLEF2023-30th-place-solution-master/usefulFunc/pesudo_labelv12_ensemble.csv')
 # pesudo_df['primary_label'] = pesudo_df[pesudo_df.columns[1:]].idxmax(axis=1)
 # pesudo_df['rating'] = 5
 
@@ -89,7 +89,6 @@ pesudo_df = pd.read_csv('/root/projects/BirdClef2025/BirdCLEF2023-30th-place-sol
 
 df_train = pd.concat([df_train, pd.get_dummies(df_train['primary_label']).astype(np.int32)], axis=1)
 df_valid = pd.concat([df_valid, pd.get_dummies(df_valid['primary_label']).astype(np.int32)], axis=1)
-df_train = pd.concat((df_train,pesudo_df),axis=0)
 
 birds = list(pd.get_dummies(df_train['primary_label']).columns)
 missing_birds = list(set(list(df_train.primary_label.unique())).difference(list(df_valid.primary_label.unique())))
@@ -128,7 +127,7 @@ wav_transform = Compose(
                 ]
             )
 
-train_set = BirdDatasetTwoLabel(df_train,bird_cols=birds,sr = CFG.sample_rate,duration = CFG.duration,train = True,audio_augmentations=wav_transform)
+train_set = BirdDatasetWithPseudoLabel(df_train,pesudo_df,bird_cols=birds,sr=CFG.sample_rate, duration=CFG.duration, audio_augmentations=wav_transform, train=True)
 val_set = BirdDatasetTwoLabel(df_valid,bird_cols=birds,sr = CFG.sample_rate,duration = CFG.infer_duration,train = False)
 trainloader = DataLoader(train_set,batch_size=CFG.batch_size,num_workers=16,pin_memory=True,shuffle=True)
 valloader = DataLoader(val_set,batch_size=CFG.batch_size,shuffle=False,num_workers=16,pin_memory=True)
@@ -203,8 +202,6 @@ for i in range(CFG.epochs):
                 with torch.no_grad():
                     pred_teacher = model_teacher.forward(images)
                 mld_loss = loss_mld(pred_teacher,pred_student)
-                # rkd_loss = dist_criterion(features_student,features_teacher)
-                # akd_loss = angle_criterion(features_student,features_teacher)
                 loss = 0.1*loss+0.9*mld_loss
             else:
                 images = data_label_list[0]
@@ -215,8 +212,6 @@ for i in range(CFG.epochs):
                     pred_teacher = model_teacher.forward(images)
                 
                 mld_loss = loss_mld(pred_teacher,pred_student)
-                # rkd_loss = dist_criterion(features_student,features_teacher)
-                # akd_loss = angle_criterion(features_student,features_teacher)
                 loss = 0.1*loss+0.9*mld_loss
             loss = loss/CFG.n_accumulate
 

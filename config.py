@@ -4,11 +4,11 @@ class CFG:
     seed = 42
     num_classes = 206
     batch_size = 64
-    epochs = 30
+    epochs = 50
     PRECISION = 16    
     PATIENCE = 8    
     img_size = [224,224]
-    model = "tf_efficientnetv2_b0"
+    model = "tf_efficientnetv2_b3"
     pretrained = True            
     weight_decay = 1e-4
     use_mixup = True
@@ -30,7 +30,7 @@ class CFG:
     instance_mixup_pro = 0.5
     instance_mixup_alpha = 0.3 
 
-    finetune_weight = False
+    finetune_weight = True
 
     fmin = 40
     fmax = 14000
