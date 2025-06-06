@@ -127,8 +127,8 @@ wav_transform = Compose(
 
 train_set = BirdDatasetTwoLabel(df_train,bird_cols=birds,sr = CFG.sample_rate,duration = CFG.duration,train = True,audio_augmentations=wav_transform)
 val_set = BirdDatasetTwoLabel(df_valid,bird_cols=birds,sr = CFG.sample_rate,duration = CFG.infer_duration,train = False)
-trainloader = DataLoader(train_set,batch_size=CFG.batch_size,num_workers=16,pin_memory=True,shuffle=True)   
-valloader = DataLoader(val_set,batch_size=CFG.batch_size,shuffle=False,num_workers=16,pin_memory=True)
+trainloader = DataLoader(train_set,batch_size=CFG.batch_size,num_workers=0,pin_memory=True,shuffle=True)   
+valloader = DataLoader(val_set,batch_size=CFG.batch_size,shuffle=False,num_workers=0,pin_memory=True)
 
 # loss
 # criterion = torch.nn.BCEWithLogitsLoss()
@@ -141,8 +141,7 @@ model = BirdClefCNNFCModel(CFG.model,num_classes=CFG.num_classes,pretrained=CFG.
 
 # optimzer
 if CFG.finetune_weight == True:
-    pretrianed_dict = torch.load('/root/projects/BirdClef2025/BirdCLEF2023-30th-place-solution-master/logs/2025-04-21T17:36-pretrain-efv2s-CNN/saved_model_lastepoch.pt')
-
+    pretrianed_dict = torch.load('/root/projects/BirdClef2025/BirdCLEF2023-30th-place-solution-master/logs/2025-03-19T16:33-pretrain-efv2b3Pretrain/saved_model_lastepoch.pt')
     to_load_dict = dict()
     for k,v in pretrianed_dict.items():
         if 'backbone' in k:
@@ -181,6 +180,7 @@ for i in range(CFG.epochs):
         weights = weights.to(CFG.device)
         images = model.get_mel_gram(audios)
         images = torch.repeat_interleave(images.unsqueeze(1),repeats=3,dim=1)
+        images = F.interpolate(images, size=CFG.img_size, mode='bilinear', align_corners=False)
 
         data_label_list = mixup_data(images,labels)
         with amp.autocast(enabled=True):
@@ -220,7 +220,9 @@ for i in range(CFG.epochs):
         with torch.no_grad():
             images = model.get_mel_gram(audios)
             images = torch.repeat_interleave(images.unsqueeze(1),repeats=3,dim=1)
+            images = F.interpolate(images, size=CFG.img_size, mode='bilinear', align_corners=False)
             pred = model.forward(images)
+            pred = torch.sigmoid(pred)
             # pred = (pred['clipwise_output'] + pred['maxframewise_output'])/2
         predall_tensor = torch.cat((predall_tensor,pred),dim=0)
         gtall_tensor = torch.cat((gtall_tensor,labels),dim=0)

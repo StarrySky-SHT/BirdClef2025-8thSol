@@ -4,11 +4,12 @@ class CFG:
     seed = 42
     num_classes = 206
     batch_size = 64
-    epochs = 50
+    epochs = 40
     PRECISION = 16    
     PATIENCE = 8    
-    img_size = [224,224]
-    model = "tf_efficientnetv2_b3"
+    img_size = [626,192]
+    model = "tf_efficientnetv2_b2"
+    # model = "seresnext26t_32x4d"
     pretrained = True            
     weight_decay = 1e-4
     use_mixup = True

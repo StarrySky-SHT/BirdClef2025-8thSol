@@ -5,3 +5,4 @@
 /usefulFunc/*.xml
 /usefulFunc/*.bin
 /usefulFunc/*.onnx
+/onnx_model/*

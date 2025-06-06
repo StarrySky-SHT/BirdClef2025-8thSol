@@ -1,6 +1,6 @@
 import os
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-os.environ['CUDA_VISIBLE_DEVICES'] = "2"
+os.environ['CUDA_VISIBLE_DEVICES'] = "1"
 import sys
 sys.path.append('/root/projects/BirdClef2025/BirdCLEF2023-30th-place-solution-master/')
 

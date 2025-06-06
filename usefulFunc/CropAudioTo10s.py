@@ -7,10 +7,12 @@ src_path = '/root/projects/BirdClef2025/data/train_soundscapes/'
 def cut_audio(filename):
     src_path = '/root/projects/BirdClef2025/data/train_soundscapes/'
     audio,sr = sf.read(src_path+filename)
-    for time in range(0,60,10):
+    for time in range(5,65,10):
+        if time == 55:
+            continue
         audio_seg = audio[int(sr*time):int(sr*(time+10))]
         # write to file
-        sf.write('/root/projects/BirdClef2025/data/train_soundscapes_10s/'+filename.replace('.ogg','')+'_'+str(time)+'s'+'.ogg',audio_seg,sr)
+        sf.write('/root/projects/BirdClef2025/data/train_soundscapes_10s_sw_5s/'+filename.replace('.ogg','')+'_'+str(time)+'s'+'.ogg',audio_seg,sr)
 
 filelist = glob('/root/projects/BirdClef2025/data/train_soundscapes/*.ogg')
 filelist.sort()

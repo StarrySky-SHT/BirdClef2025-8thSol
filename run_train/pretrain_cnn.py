@@ -1,6 +1,6 @@
 import os
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-os.environ['CUDA_VISIBLE_DEVICES'] = "1"
+os.environ['CUDA_VISIBLE_DEVICES'] = "2"
 import sys
 sys.path.append('/root/projects/BirdClef2025/BirdCLEF2023-30th-place-solution-master/')
 
@@ -16,7 +16,7 @@ import albumentations as A
 from dataset import BirdDataset,fetch_scheduler,AudioAug
 from torch.utils.data import Dataset,DataLoader
 from torch import optim
-from model import BirdClefCNNModel,BirdClefSEDAttModel,BirdClefCNNFCModel
+from model import BirdClefCNNModel,BirdClefSEDAttModel,BirdClefCNNFCModel,BirdClefCNNFCModelV2
 from torch.cuda import amp  
 import time
 from tensorboardX import SummaryWriter

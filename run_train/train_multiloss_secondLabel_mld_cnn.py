@@ -1,7 +1,7 @@
 import os
 
 import torch.utils
-os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+os.environ['CUDA_VISIBLE_DEVICES'] = '3'
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 import sys
@@ -17,10 +17,10 @@ import os
 import sys
 from config import CFG  
 import albumentations as A
-from dataset import BirdDataset,fetch_scheduler,AudioAug,BirdDatasetTwoLabel,BirdDatasetSplitTrain
+from dataset import BirdDataset,fetch_scheduler,AudioAug,BirdDatasetTwoLabel,BirdDatasetSplitTrain,BirdDatasetWithPseudoLabel
 from torch.utils.data import Dataset,DataLoader,WeightedRandomSampler
 from torch import optim
-from model import BirdClefModel,BirdClefSEDModel,BirdClefSEDAttModel,BirdSetSEDModel
+from model import BirdClefSEDAttModel,TeacherModel,BirdClefCNNFCModel,BirdClefCNNModel
 from torch.cuda import amp  
 import time
 from tensorboardX import SummaryWriter
@@ -30,10 +30,12 @@ import sklearn
 from torchtoolbox.tools import mixup
 from torch.nn.functional import binary_cross_entropy_with_logits,binary_cross_entropy
 from utils import *
-from losses import SmoothBCEFocalLoss,MultiLoss,MultiLossWeighting,BCELoss
+from losses import MLDLoss,MLDLogitLoss,BCECNNLoss
 import  audiomentations as AA
 from torchtoolbox.tools import cutmix_data,MixingDataController
 import torch.nn.functional as F
+import tensorflow_hub as hub
+import tensorflow as tf
 
 
 def get_logger(filename, verbosity=1, name=None):
@@ -76,13 +78,19 @@ df_valid = df_valid.sample(frac=0.1,random_state=42)
 df_train['path'] = CFG.data_root+df_train['filename']
 df_valid['path'] = CFG.data_root+df_valid['filename']
 
-# external_train = pd.read_csv('/root/projects/BirdClef2025/data/external_train.csv')
-# df_train = pd.concat((df_train,external_train))
+pesudo_df = pd.read_csv('/root/projects/BirdClef2025/BirdCLEF2023-30th-place-solution-master/usefulFunc/pesudo_labelv16_0.4thred.csv')
+pesudo_df['primary_label'] = pesudo_df[pesudo_df.columns[1:]].idxmax(axis=1)
+pesudo_df['rating'] = 5
+# df_train = pd.concat((df_train,pesudo_df))
+external_train = pd.read_csv('/root/projects/BirdClef2025/data/external_train.csv')
+df_train = pd.concat((df_train,external_train))
 
 df_train = pd.concat([df_train, pd.get_dummies(df_train['primary_label'])], axis=1)
 df_valid = pd.concat([df_valid, pd.get_dummies(df_valid['primary_label'])], axis=1)
 
-birds = list(df_train.primary_label.unique())
+df_train = pd.concat((df_train,pesudo_df))
+
+birds = list(pd.get_dummies(df_train['primary_label']).columns)
 missing_birds = list(set(list(df_train.primary_label.unique())).difference(list(df_valid.primary_label.unique())))
 non_missing_birds = list(set(list(df_train.primary_label.unique())).difference(missing_birds))
 df_valid[missing_birds] = 0
@@ -109,34 +117,46 @@ wav_transform = Compose(
                             GaussianNoise(p=1, min_snr=5, max_snr=20),
                             PinkNoise(p=1, min_snr=5, max_snr=20)
                         ],
-                        p=0.5,
+                        p=0.1,
                     ),
-                    AA.Shift(p=0.2),
-                    RandomVolume(p=0.2),
+                    AA.Shift(p=0.1),
+                    RandomVolume(p=0.1),
                     # PitchShift(p=0.2),
-                    AA.AddBackgroundNoise(all_bgnoise,min_snr_db=3,max_snr_db=30,p=0.5),
-                    AA.Gain(min_gain_db=-12, max_gain_db=12, p=0.2),
+                    AA.AddBackgroundNoise(all_bgnoise,min_snr_db=3,max_snr_db=30,p=0.1),
+                    AA.Gain(min_gain_db=-12, max_gain_db=12, p=0.1),
                 ]
             )
-train_set = BirdDatasetTwoLabel(df_train,sr = CFG.sample_rate,duration = CFG.duration,train = True,audio_augmentations=wav_transform)
-val_set = BirdDatasetTwoLabel(df_valid,sr = CFG.sample_rate,duration = CFG.infer_duration,train = False)
+
+train_set = BirdDatasetTwoLabel(df_train,bird_cols=birds,sr = CFG.sample_rate,duration = CFG.duration,train = True,audio_augmentations=wav_transform)
+val_set = BirdDatasetTwoLabel(df_valid,bird_cols=birds,sr = CFG.sample_rate,duration = CFG.infer_duration,train = False)
 trainloader = DataLoader(train_set,batch_size=CFG.batch_size,num_workers=16,pin_memory=True,shuffle=True)
 valloader = DataLoader(val_set,batch_size=CFG.batch_size,shuffle=False,num_workers=16,pin_memory=True)
 
 # loss
 # criterion = torch.nn.BCEWithLogitsLoss()
-loss_ = BCELoss()
+loss_ = BCECNNLoss()
+loss_mld = MLDLoss()
+# dist_criterion = RkdDistance()
+# angle_criterion = RKdAngle()
 # loss_ = MultiLossWeighting(smoothing=CFG.smoothing_factor)
 
 # model
-model = BirdSetSEDModel(num_classes=CFG.num_classes).cuda()
+model_teacher = TeacherModel()
+model = BirdClefCNNFCModel(CFG.model,num_classes=CFG.num_classes,pretrained=CFG.pretrained).cuda()
 
 # optimzer
 if CFG.finetune_weight == True:
-    backbone_params = list(filter(lambda x: 'att_block' not in x[0],model.named_parameters())) # vit
+    pretrianed_dict = torch.load('/root/projects/BirdClef2025/BirdCLEF2023-30th-place-solution-master/logs/2025-06-02T15:04-pretrain-efv2b2/saved_model_lastepoch.pt')
+    to_load_dict = dict()
+    for k,v in pretrianed_dict.items():
+        if 'backbone' in k or 'fc1' in k:
+            to_load_dict[k] = v
+    model.load_state_dict(to_load_dict,strict=False)
+
+    backbone_params = list(filter(lambda x: 'fc_seq' not in x[0],model.named_parameters())) # vit
     for ind, param in enumerate(backbone_params):
         backbone_params[ind] = param[1]
-    fc_params         = list(filter(lambda x: 'att_block' in x[0],model.named_parameters())) # vit
+    fc_params         = list(filter(lambda x: 'fc_seq' in x[0],model.named_parameters())) # vit
     for ind, param in enumerate(fc_params):
         fc_params[ind] = param[1]
     to_optim          = [{'params':backbone_params,'lr':CFG.lr},
@@ -144,11 +164,9 @@ if CFG.finetune_weight == True:
 else:
     to_optim = model.parameters()
 
+
 optimizer = optim.Adam(to_optim,lr=CFG.lr)
 scheduler = fetch_scheduler(optimizer,len(trainloader))
-
-cutmix_aug = MixingDataController(mixup=CFG.use_mixup,cutmix=CFG.use_cutmix,mixup_prob=CFG.mixup_pro,cutmix_prob=CFG.cutmix_pro)
-mixup_clef = Mixup(mix_beta=1)
 
 best_cmAP = -np.inf
 current_time = time.strftime("%Y-%m-%dT%H:%M", time.localtime())
@@ -165,20 +183,43 @@ for i in range(CFG.epochs):
         audios = audios.to(torch.float32).to(CFG.device)
         labels = labels.to(CFG.device)
         weights = weights.to(CFG.device)
+        if np.random.uniform(0,1) < 0.5:
+            summix_res = sumix(audios,labels)
+            audios = summix_res['waves']
+            labels = summix_res['labels']
+
         images = model.get_mel_gram(audios)
         images = torch.repeat_interleave(images.unsqueeze(1),repeats=3,dim=1)
 
-        data_label_list = mixup_data(images,labels)
+        data_label_list = mixup_data(images,labels,use_mixup=CFG.use_mixup)
         with amp.autocast(enabled=True):
             if data_label_list[-1]:
                 images = data_label_list[0]
-                pred = model(images)
+                pred = model.forward(images)
+                pred_student = torch.sigmoid(pred)
                 label_a,label_b = data_label_list[1],data_label_list[2]
-                loss = mixup_criterion(loss_,pred,label_a,label_b,data_label_list[3],classes_weight=weights)
+                label_total = torch.clamp(label_a+label_b,0,1)
+                loss_label = loss_(pred,label_total)
+                # loss_label = mixup_criterion(loss_,pred,label_total,label_total,data_label_list[3],classes_weight=weights)
+                with torch.no_grad():
+                    pred_teacher,pred_teacher_kd = model_teacher.forward(images)
+                    pred_teacher_hard = (pred_teacher>0.4).to(torch.long)
+                mld_loss = loss_mld(pred_teacher_kd,pred_student)
+                loss_pesudo = loss_(pred,pred_teacher_hard)
+                loss = (loss_label+mld_loss+loss_pesudo)/3
+                # loss = (loss_label + loss_pesudo)/2
             else:
                 images = data_label_list[0]
-                pred = model(images)
-                loss = loss_(pred,data_label_list[1],weights=weights)
+                pred = model.forward(images)
+                pred_student = torch.sigmoid(pred)
+                loss_label = loss_(pred,data_label_list[1]) 
+                with torch.no_grad():
+                    pred_teacher,pred_teacher_kd = model_teacher.forward(images)
+                    pred_teacher_hard = (pred_teacher>0.4).to(torch.long)
+                mld_loss = loss_mld(pred_teacher_kd,pred_student)
+                loss_pesudo = loss_(pred,pred_teacher_hard)
+                loss = (loss_label+mld_loss+loss_pesudo)/3
+                # loss = (loss_label + loss_pesudo)/2
             loss = loss/CFG.n_accumulate
 
         scaler.scale(loss).backward()
@@ -207,7 +248,7 @@ for i in range(CFG.epochs):
             images = model.get_mel_gram(audios)
             images = torch.repeat_interleave(images.unsqueeze(1),repeats=3,dim=1)
             pred = model.forward(images)
-            pred = (pred['clipwise_output'] + pred['maxframewise_output'])/2
+            pred = torch.sigmoid(pred)
         predall_tensor = torch.cat((predall_tensor,pred),dim=0)
         gtall_tensor = torch.cat((gtall_tensor,labels),dim=0)
     

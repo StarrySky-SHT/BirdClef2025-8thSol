@@ -1,7 +1,7 @@
 import os
 
 import torch.utils
-os.environ['CUDA_VISIBLE_DEVICES'] = '2'
+os.environ['CUDA_VISIBLE_DEVICES'] = '3'
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 import sys
@@ -30,7 +30,7 @@ import sklearn
 from torchtoolbox.tools import mixup
 from torch.nn.functional import binary_cross_entropy_with_logits,binary_cross_entropy
 from utils import *
-from losses import FocalLossBCE,BCELoss,LEDLoss,RKdAngle,RkdDistance,MLDLoss
+from losses import FocalBCELoss,BCELoss,LEDLoss,RKdAngle,RkdDistance,MLDLoss
 import  audiomentations as AA
 from torchtoolbox.tools import cutmix_data,MixingDataController
 import torch.nn.functional as F
@@ -78,18 +78,17 @@ df_valid = df_valid.sample(frac=0.1,random_state=42)
 df_train['path'] = CFG.data_root+df_train['filename']
 df_valid['path'] = CFG.data_root+df_valid['filename']
 
-# external_train = pd.read_csv('/root/projects/BirdClef2025/data/external_train.csv')
-# df_train = pd.concat((df_train,external_train))
-pesudo_df = pd.read_csv('/root/projects/BirdClef2025/BirdCLEF2023-30th-place-solution-master/usefulFunc/pesudo_labelv14_ensemble.csv')
-# pesudo_df['primary_label'] = pesudo_df[pesudo_df.columns[1:]].idxmax(axis=1)
-# pesudo_df['rating'] = 5
+pesudo_df = pd.read_csv('/root/projects/BirdClef2025/BirdCLEF2023-30th-place-solution-master/usefulFunc/pesudo_labelv16_0.4thred.csv')
+pesudo_df['primary_label'] = pesudo_df[pesudo_df.columns[1:]].idxmax(axis=1)
+pesudo_df['rating'] = 5
+# df_train = pd.concat((df_train,pesudo_df))
+external_train = pd.read_csv('/root/projects/BirdClef2025/data/external_train.csv')
+df_train = pd.concat((df_train,external_train))
 
-# external_train = pd.read_csv('/root/projects/BirdClef2025/data/external_train.csv')
-# df_train = pd.concat((df_train,external_train))
+df_train = pd.concat([df_train, pd.get_dummies(df_train['primary_label'])], axis=1)
+df_valid = pd.concat([df_valid, pd.get_dummies(df_valid['primary_label'])], axis=1)
 
-df_train = pd.concat([df_train, pd.get_dummies(df_train['primary_label']).astype(np.int32)], axis=1)
-df_valid = pd.concat([df_valid, pd.get_dummies(df_valid['primary_label']).astype(np.int32)], axis=1)
-df_train = pd.concat((df_train,pesudo_df),axis=0)
+df_train = pd.concat((df_train,pesudo_df))
 
 birds = list(pd.get_dummies(df_train['primary_label']).columns)
 missing_birds = list(set(list(df_train.primary_label.unique())).difference(list(df_valid.primary_label.unique())))
@@ -147,7 +146,7 @@ model = BirdClefSEDAttModel(CFG.model,num_classes=CFG.num_classes,pretrained=CFG
 
 # optimzer
 if CFG.finetune_weight == True:
-    pretrianed_dict = torch.load('/root/projects/BirdClef2025/BirdCLEF2023-30th-place-solution-master/logs/2025-03-19T16:33-pretrain-efv2b3Pretrain/saved_model_lastepoch.pt')
+    pretrianed_dict = torch.load('/root/projects/BirdClef2025/BirdCLEF2023-30th-place-solution-master/logs/2025-05-20T05:04-pretrain/saved_model_lastepoch.pt')
     to_load_dict = dict()
     for k,v in pretrianed_dict.items():
         if 'backbone' in k or 'fc1' in k:
@@ -185,7 +184,7 @@ for i in range(CFG.epochs):
         labels = labels.to(CFG.device)
         weights = weights.to(CFG.device)
         if np.random.uniform(0,1) < 0.5:
-            summix_res = sumix(audios,labels)
+            summix_res = sumixv2(audios,labels)
             audios = summix_res['waves']
             labels = summix_res['labels']
 
@@ -199,7 +198,9 @@ for i in range(CFG.epochs):
                 pred = model.forward(images)
                 pred_student = (pred['clipwise_output'] + pred['maxframewise_output'])/2
                 label_a,label_b = data_label_list[1],data_label_list[2]
-                loss = mixup_criterion(loss_,pred,label_a,label_b,data_label_list[3],classes_weight=weights)
+                label_total = torch.clamp(label_a+label_b,0,1)
+                # loss = mixup_criterion(loss_,pred,label_a,label_b,data_label_list[3],classes_weight=weights)
+                loss = mixup_criterion(loss_,pred,label_total,label_total,data_label_list[3],classes_weight=weights)
                 with torch.no_grad():
                     pred_teacher = model_teacher.forward(images)
                 mld_loss = loss_mld(pred_teacher,pred_student)

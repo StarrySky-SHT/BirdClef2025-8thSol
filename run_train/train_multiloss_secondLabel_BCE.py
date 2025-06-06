@@ -28,7 +28,7 @@ from torch import nn
 from metrics import padded_cmap,map_score
 import sklearn
 from torchtoolbox.tools import mixup
-from torch.nn.functional import binary_cross_entropy_with_logits,binary_cross_entropy
+from torch.nn.functional import binary_cross_entropy_with_logits
 from utils import *
 from losses import SmoothBCEFocalLoss,MultiLoss,MultiLossWeighting,BCELoss
 import  audiomentations as AA
@@ -77,7 +77,7 @@ df_valid = df_valid.sample(frac=0.1,random_state=42)
 df_train['path'] = CFG.data_root+df_train['filename']
 df_valid['path'] = CFG.data_root+df_valid['filename']
 
-# pesudo_df = pd.read_csv('/root/projects/BirdClef2025/BirdCLEF2023-30th-place-solution-master/usefulFunc/pesudo_labelv13_ensemble.csv')
+# pesudo_df = pd.read_csv('/root/projects/BirdClef2025/BirdCLEF2023-30th-place-solution-master/usefulFunc/pesudo_labelv16_0.4thred.csv')
 # pesudo_df['primary_label'] = pesudo_df[pesudo_df.columns[1:]].idxmax(axis=1)
 # pesudo_df['rating'] = 5
 # df_train = pd.concat((df_train,pesudo_df))
@@ -86,6 +86,8 @@ df_train = pd.concat((df_train,external_train))
 
 df_train = pd.concat([df_train, pd.get_dummies(df_train['primary_label'])], axis=1)
 df_valid = pd.concat([df_valid, pd.get_dummies(df_valid['primary_label'])], axis=1)
+
+# df_train = pd.concat((df_train,pesudo_df))
 
 birds = list(pd.get_dummies(df_train['primary_label']).columns)
 missing_birds = list(set(list(df_train.primary_label.unique())).difference(list(df_valid.primary_label.unique())))
@@ -175,6 +177,12 @@ for i in range(CFG.epochs):
         audios = audios.to(torch.float32).to(CFG.device)
         labels = labels.to(CFG.device)
         weights = weights.to(CFG.device)
+
+        if np.random.uniform(0,1) < 0.5:
+            summix_res = sumixv2(audios,labels)
+            audios = summix_res['waves']
+            labels = summix_res['labels']
+
         images = model.get_mel_gram(audios)
         images = torch.repeat_interleave(images.unsqueeze(1),repeats=3,dim=1)
 
@@ -184,7 +192,9 @@ for i in range(CFG.epochs):
                 images = data_label_list[0]
                 pred = model(images)
                 label_a,label_b = data_label_list[1],data_label_list[2]
-                loss = mixup_criterion(loss_,pred,label_a,label_b,data_label_list[3],classes_weight=weights)
+                # loss = mixup_criterion(loss_,pred,label_a,label_b,data_label_list[3],classes_weight=weights)
+                label_total = torch.clamp(label_a+label_b,0,1)
+                loss = mixup_criterion(loss_,pred,label_total,label_total,data_label_list[3],classes_weight=weights)
             else:
                 images = data_label_list[0]
                 pred = model(images)
@@ -212,7 +222,6 @@ for i in range(CFG.epochs):
     for idx,(audios,labels,weights) in enumerate(valloader):
         audios = audios.to(torch.float32).to(CFG.device)
         labels = labels.to(torch.long).to(CFG.device)
-
         with torch.no_grad():
             images = model.get_mel_gram(audios)
             images = torch.repeat_interleave(images.unsqueeze(1),repeats=3,dim=1)

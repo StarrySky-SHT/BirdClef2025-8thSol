@@ -26,6 +26,64 @@ from audiomentations.core.utils import (
 import torch.nn.functional as F
 from tqdm import tqdm
 
+def random_shift_along_H(x,mix_pro=0.5):
+    """
+    对输入的 4D tensor (B, C, H, W)，在 H 维（dim=2）上进行循环移位，
+    移动量为 [H//4, 3*H//4] 之间的随机值。
+    """
+    H = x.size(2)
+    shift = random.randint(H // 4, 3 * H // 4)
+    x_roll = torch.roll(x, shifts=shift, dims=2)
+    if np.random.uniform(0,1)>mix_pro:
+        return x_roll
+    else:
+        x = torch.max(torch.cat((x_roll.unsqueeze(0), x.unsqueeze(0)),dim=0), dim=0)[0]
+    return x
+
+def filt_aug(features, db_range=[-6, 6], n_band=[3, 6], min_bw=6, filter_type="linear"):
+    # this is updated FilterAugment algorithm used for ICASSP 2022
+    if not isinstance(filter_type, str):
+        if torch.rand(1).item() < filter_type:
+            filter_type = "step"
+            n_band = [2, 5]
+            min_bw = 4
+        else:
+            filter_type = "linear"
+            n_band = [3, 6]
+            min_bw = 6
+
+    batch_size, n_freq_bin, _,_ = features.shape
+    n_freq_band = torch.randint(low=n_band[0], high=n_band[1], size=(1,)).item()   # [low, high)
+    if n_freq_band > 1:
+        while n_freq_bin - n_freq_band * min_bw + 1 < 0:
+            min_bw -= 1
+        band_bndry_freqs = torch.sort(torch.randint(0, n_freq_bin - n_freq_band * min_bw + 1,
+                                                    (n_freq_band - 1,)))[0] + \
+                           torch.arange(1, n_freq_band) * min_bw
+        band_bndry_freqs = torch.cat((torch.tensor([0]), band_bndry_freqs, torch.tensor([n_freq_bin])))
+
+        if filter_type == "step":
+            band_factors = torch.rand((batch_size, n_freq_band)).to(features) * (db_range[1] - db_range[0]) + db_range[0]
+            band_factors = 10 ** (band_factors / 20)
+
+            freq_filt = torch.ones((batch_size, n_freq_bin, 1)).to(features)
+            for i in range(n_freq_band):
+                freq_filt[:, band_bndry_freqs[i]:band_bndry_freqs[i + 1], :] = band_factors[:, i].unsqueeze(-1).unsqueeze(-1)
+
+        elif filter_type == "linear":
+            band_factors = torch.rand((batch_size, n_freq_band + 1)).to(features) * (db_range[1] - db_range[0]) + db_range[0]
+            freq_filt = torch.ones((batch_size, n_freq_bin, 1)).to(features)
+            for i in range(n_freq_band):
+                for j in range(batch_size):
+                    freq_filt[j, band_bndry_freqs[i]:band_bndry_freqs[i+1], :] = \
+                        torch.linspace(band_factors[j, i], band_factors[j, i+1],
+                                       band_bndry_freqs[i+1] - band_bndry_freqs[i]).unsqueeze(-1)
+            freq_filt = 10 ** (freq_filt / 20)
+        return features * freq_filt.unsqueeze(-1)
+
+    else:
+        return features
+
 def sumix(waves: torch.Tensor, labels: torch.Tensor, max_percent: float = 1.0, min_percent: float = 0.3):
     batch_size = len(labels)
     perm = torch.randperm(batch_size)
@@ -38,6 +96,26 @@ def sumix(waves: torch.Tensor, labels: torch.Tensor, max_percent: float = 1.0, m
     label_coeffs_1 = torch.where(coeffs_1 >= 0.5, 1, 1 - 2 * (0.5 - coeffs_1))
     label_coeffs_2 = torch.where(coeffs_2 >= 0.5, 1, 1 - 2 * (0.5 - coeffs_2))
     labels = label_coeffs_1 * labels + label_coeffs_2 * labels[perm]
+
+    waves = coeffs_1 * waves + coeffs_2 * waves[perm]
+    return {
+        "waves": waves,
+        "labels": torch.clip(labels, 0, 1)
+    }
+
+def sumixv2(waves: torch.Tensor, labels: torch.Tensor, max_percent: float = 1.0, min_percent: float = 0.3):
+    batch_size = len(labels)
+    perm = torch.randperm(batch_size)
+    coeffs_1 = torch.rand(batch_size, device=waves.device).view(-1, 1) * (
+        max_percent  - min_percent
+    ) + min_percent
+    coeffs_2 = torch.rand(batch_size, device=waves.device).view(-1, 1) * (
+        max_percent  - min_percent
+    ) + min_percent
+    # label_coeffs_1 = torch.where(coeffs_1 >= 0.5, 1, 1 - 2 * (0.5 - coeffs_1))
+    # label_coeffs_2 = torch.where(coeffs_2 >= 0.5, 1, 1 - 2 * (0.5 - coeffs_2))
+    # labels = label_coeffs_1 * labels + label_coeffs_2 * labels[perm]
+    labels = labels + labels[perm]
 
     waves = coeffs_1 * waves + coeffs_2 * waves[perm]
     return {
@@ -715,3 +793,7 @@ def update_bn(loader, model, origin_model, device=None):
     for bn_module in momenta.keys():
         bn_module.momentum = momenta[bn_module]
     model.train(was_training)
+
+if __name__ == '__main__':
+    data = torch.randn((4,3,626,192))
+    data = filt_aug(data.permute(0,3,1,2)).permute(0,2,3,1)

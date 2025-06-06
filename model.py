@@ -16,6 +16,8 @@ import tensorflow as tf
 import tensorflow_hub as hub
 import pandas as pd
 import torchvision
+from utils import filt_aug,random_shift_along_H
+from copy import deepcopy
 
 from typing import Optional
 
@@ -338,12 +340,11 @@ class AttBlockV2(nn.Module):
         elif self.activation == 'sigmoid':
             return torch.sigmoid(x)
 
-
 class BirdClefSEDAttModel(nn.Module):
-    def __init__(self, model_name=CFG.model, num_classes = CFG.num_classes, pretrained = CFG.pretrained,p=0.5):
+    def __init__(self, model_name=CFG.model, num_classes = CFG.num_classes, pretrained = CFG.pretrained,p=0.5,window_size=CFG.window_size,hop_size=CFG.hop_size,drop_rate=0.,drop_path_rate=0.,fc1_drop_rate=0.3):
         super().__init__()
         self.num_classes = num_classes
-        self.backbone = timm.create_model(model_name, pretrained=pretrained)
+        self.backbone = timm.create_model(model_name, pretrained=pretrained,drop_rate=drop_rate,drop_path_rate=drop_path_rate)
         if 'effi' in model_name:
             self.backbone.global_pool = nn.Identity()
             self.backbone.classifier = nn.Identity()
@@ -354,14 +355,13 @@ class BirdClefSEDAttModel(nn.Module):
         self.pooling = GeM()
         self.SpecAug = SpecAugmentation(time_drop_width=64, time_stripes_num=2,freq_drop_width=8, freq_stripes_num=2)
         self.use_spec_aug = CFG.use_spec_aug
-        self.bn0 = nn.BatchNorm2d(CFG.mel_bins)
-    
+        self.bn0 = nn.BatchNorm2d(CFG.img_size[1])    
         # Spectrogram extractor
         self.spectrogram_extractor = MelSpectrogram(
             sample_rate=CFG.sample_rate,
             n_fft=CFG.n_fft,
-            win_length=CFG.window_size,
-            hop_length=CFG.hop_size,
+            win_length=window_size,
+            hop_length=hop_size,
             f_min=CFG.fmin,
             f_max=CFG.fmax,
             pad=0,
@@ -374,6 +374,7 @@ class BirdClefSEDAttModel(nn.Module):
         self.normlize = NormalizeMelSpec()
         self.fc1 = nn.Linear(self.backbone.num_features, self.backbone.num_features, bias=True)
         self.att_block = AttBlockV2(self.backbone.num_features, num_classes, activation="sigmoid")
+        self.fc1_drop_rate = fc1_drop_rate
         self.init_weight()
 
     def init_weight(self):
@@ -396,6 +397,12 @@ class BirdClefSEDAttModel(nn.Module):
         if CFG.use_spec_aug and self.training:
             if np.random.uniform(0,1)>CFG.p_spec_aug:
                 x = self.SpecAug(x)
+            if np.random.uniform(0,1)>CFG.p_spec_aug:
+                x = filt_aug(x.permute(0,3,1,2),filter_type='linear').permute(0,2,3,1)
+            if np.random.uniform(0,1)>CFG.p_spec_aug:
+                x = filt_aug(x.permute(0,3,1,2),filter_type='step').permute(0,2,3,1)
+            # if np.random.uniform(0,1)>CFG.p_spec_aug:
+            #     x = random_shift_along_H(x,mix_pro=0.5)
 
         x = x.transpose(1, 3)
         x = self.bn0(x)
@@ -406,6 +413,221 @@ class BirdClefSEDAttModel(nn.Module):
         x = self.backbone.forward_features(x)
         features = nn.AdaptiveAvgPool2d(1)(x).squeeze(3).squeeze(2) # B,C
         
+        # Aggregate in frequency axis
+        x = torch.mean(x, dim=2)
+
+        x1 = F.max_pool1d(x, kernel_size=3, stride=1, padding=1)
+        x2 = F.avg_pool1d(x, kernel_size=3, stride=1, padding=1)
+        x = x1 + x2
+
+        x = F.dropout(x, p=self.fc1_drop_rate, training=self.training)
+        x = x.transpose(1, 2)
+        x = F.relu(self.fc1(x),inplace=False)
+        x = x.transpose(1, 2)
+        x = F.dropout(x, p=self.fc1_drop_rate, training=self.training)
+
+        (clipwise_output, norm_att, segmentwise_output) = self.att_block(x)
+
+        maxframewise_output = nn.AdaptiveMaxPool1d(1)(segmentwise_output).squeeze(2)
+        # maxframewise_output = nn.AdaptiveAvgPool1d(1)(segmentwise_output).squeeze(2)
+        if return_features:
+            output_dict = {
+                "clipwise_output": clipwise_output,
+                "framewise_output":segmentwise_output,
+                "maxframewise_output":maxframewise_output,
+                "features":features
+            }
+        else:
+            output_dict = {
+                "clipwise_output": clipwise_output,
+                "framewise_output":segmentwise_output,
+                "maxframewise_output":maxframewise_output
+            }
+
+        return output_dict
+
+class BirdClefSEDAttModelDS(nn.Module):
+    def __init__(self, model_name=CFG.model, num_classes = CFG.num_classes, pretrained = CFG.pretrained,p=0.5,window_size=CFG.window_size,hop_size=CFG.hop_size,drop_rate=0.,drop_path_rate=0.,fc1_drop_rate=0.3):
+        super().__init__()
+        self.num_classes = num_classes
+        out_indices = (2,3,4)
+        self.backbone = timm.create_model(model_name, pretrained=pretrained,drop_rate=drop_rate,drop_path_rate=drop_path_rate,features_only=True,out_indices=out_indices)
+        if 'effi' in model_name:
+            self.backbone.global_pool = nn.Identity()
+            self.backbone.classifier = nn.Identity()
+        elif 'eca' in model_name:
+            self.backbone.head.fc = nn.Identity()
+        if CFG.use_fsr:
+            self.backbone.conv_stem.stride = (1,1)
+        self.pooling = GeM()
+        self.SpecAug = SpecAugmentation(time_drop_width=64, time_stripes_num=2,freq_drop_width=8, freq_stripes_num=2)
+        self.use_spec_aug = CFG.use_spec_aug
+        self.bn0 = nn.BatchNorm2d(CFG.img_size[1])    
+        # Spectrogram extractor
+        self.spectrogram_extractor = MelSpectrogram(
+            sample_rate=CFG.sample_rate,
+            n_fft=CFG.n_fft,
+            win_length=window_size,
+            hop_length=hop_size,
+            f_min=CFG.fmin,
+            f_max=CFG.fmax,
+            pad=0,
+            n_mels=CFG.mel_bins,
+            power=2,
+            normalized=False,
+        )
+        # Logmel feature extractor
+        self.logmel_extractor = AmplitudeToDB(top_db=None)
+        self.normlize = NormalizeMelSpec()
+        out_features_num = self.backbone.feature_info.channels()
+        self.cls_modules = nn.Sequential()
+        for feature_num in out_features_num:
+            self.cls_modules.append(
+                nn.ModuleDict({
+                    'fc1':nn.Linear(feature_num, feature_num, bias=True),
+                    'att':AttBlockV2(feature_num, num_classes, activation="sigmoid")}
+                )
+            )
+        self.fc1_drop_rate = fc1_drop_rate
+    
+    def get_mel_gram(self,audios):
+        """
+        Input: (batch_size, data_length)"""
+        x = self.spectrogram_extractor(audios) # (batch_size,freq_bins time_steps)
+        x = self.logmel_extractor(x) 
+        x = self.normlize(x)
+        x = x.permute(0,2,1)# (batch_size,time_steps, mel_bins)
+
+        return x
+
+    def forward(self, x,return_features = False):
+        x = x.contiguous()
+        # b c f t
+        if CFG.use_spec_aug and self.training:
+            if np.random.uniform(0,1)>CFG.p_spec_aug:
+                x = self.SpecAug(x)
+            if np.random.uniform(0,1)>CFG.p_spec_aug:
+                x = filt_aug(x.permute(0,3,1,2),filter_type='linear').permute(0,2,3,1)
+            if np.random.uniform(0,1)>CFG.p_spec_aug:
+                x = filt_aug(x.permute(0,3,1,2),filter_type='step').permute(0,2,3,1)
+            # if np.random.uniform(0,1)>CFG.p_spec_aug:
+            #     x = random_shift_along_H(x,mix_pro=0.5)
+
+        x = x.transpose(1, 3)
+        x = self.bn0(x)
+        x = x.transpose(1, 3)
+
+        x = x.transpose(2, 3)
+
+        x = self.backbone(x)
+        
+        return_dict = dict()
+        # Aggregate in frequency axis
+        for idx,module in enumerate(self.cls_modules):
+            this_x = torch.mean(x[idx], dim=2)
+
+            this_x1 = F.max_pool1d(this_x, kernel_size=3, stride=1, padding=1)
+            this_x2 = F.avg_pool1d(this_x, kernel_size=3, stride=1, padding=1)
+            this_x = this_x1 + this_x2
+
+            this_x = F.dropout(this_x, p=self.fc1_drop_rate, training=self.training)
+            this_x = this_x.transpose(1, 2)
+            this_x = F.relu(module['fc1'](this_x),inplace=False)
+            this_x = this_x.transpose(1, 2)
+            this_x = F.dropout(this_x, p=self.fc1_drop_rate, training=self.training)
+
+            (this_clipwise_output, this_norm_att, this_segmentwise_output) = module['att'](this_x)
+
+            this_maxframewise_output = nn.AdaptiveMaxPool1d(1)(this_segmentwise_output).squeeze(2)
+            return_dict[idx] = {
+                "clipwise_output": this_clipwise_output,
+                "framewise_output":this_segmentwise_output,
+                "maxframewise_output":this_maxframewise_output
+                }
+        return return_dict
+
+
+class BirdClefSEDAttModelFC(nn.Module):
+    def __init__(self, model_name=CFG.model, num_classes = CFG.num_classes, pretrained = CFG.pretrained,p=0.5,window_size=CFG.window_size,hop_size=CFG.hop_size):
+        super().__init__()
+        self.num_classes = num_classes
+        self.backbone = timm.create_model(model_name, pretrained=pretrained)
+        if 'effi' in model_name:
+            self.backbone.global_pool = nn.Identity()
+            self.backbone.classifier = nn.Identity()
+        elif 'eca' in model_name:
+            self.backbone.head.fc = nn.Identity()
+        if CFG.use_fsr:
+            self.backbone.conv_stem.stride = (1,1)
+        self.pooling = GeM()
+        self.SpecAug = SpecAugmentation(time_drop_width=64, time_stripes_num=2,freq_drop_width=8, freq_stripes_num=2)
+        self.use_spec_aug = CFG.use_spec_aug
+        self.bn0 = nn.BatchNorm2d(CFG.img_size[1])    
+        # Spectrogram extractor
+        self.spectrogram_extractor = MelSpectrogram(
+            sample_rate=CFG.sample_rate,
+            n_fft=CFG.n_fft,
+            win_length=window_size,
+            hop_length=hop_size,
+            f_min=CFG.fmin,
+            f_max=CFG.fmax,
+            pad=0,
+            n_mels=CFG.mel_bins,
+            power=2,
+            normalized=False,
+        )
+        # Logmel feature extractor
+        self.logmel_extractor = AmplitudeToDB(top_db=None)
+        self.normlize = NormalizeMelSpec()
+        self.fc1 = nn.Linear(self.backbone.num_features, self.backbone.num_features, bias=True)
+        self.att_block = AttBlockV2(self.backbone.num_features, num_classes, activation="sigmoid")
+        
+        self.fc_seq = nn.Sequential(
+            [
+                nn.Dropout(p=0.2),
+                nn.BatchNorm1d(self.backbone.num_features),
+                nn.Linear(self.backbone.num_features,CFG.num_classes)
+            ]
+        )
+        
+        self.init_weight()
+
+    def init_weight(self):
+        init_bn(self.bn0)
+        init_layer(self.fc1)
+    
+    def get_mel_gram(self,audios):
+        """
+        Input: (batch_size, data_length)"""
+        x = self.spectrogram_extractor(audios) # (batch_size,freq_bins time_steps)
+        x = self.logmel_extractor(x) 
+        x = self.normlize(x)
+        x = x.permute(0,2,1)# (batch_size,time_steps, mel_bins)
+
+        return x
+
+    def forward(self, x,return_features = False):
+        x = x.contiguous()
+        # b c f t
+        if CFG.use_spec_aug and self.training:
+            if np.random.uniform(0,1)>CFG.p_spec_aug:
+                x = self.SpecAug(x)
+            if np.random.uniform(0,1)>CFG.p_spec_aug:
+                x = filt_aug(x.permute(0,3,1,2),filter_type='linear').permute(0,2,3,1)
+            if np.random.uniform(0,1)>CFG.p_spec_aug:
+                x = filt_aug(x.permute(0,3,1,2),filter_type='step').permute(0,2,3,1)
+            # if np.random.uniform(0,1)>CFG.p_spec_aug:
+            #     x = random_shift_along_H(x,mix_pro=0.5)
+
+        x = x.transpose(1, 3)
+        x = self.bn0(x)
+        x = x.transpose(1, 3)
+
+        x = x.transpose(2, 3)
+
+        x = self.backbone.forward_features(x)
+        features = nn.AdaptiveAvgPool2d(1)(x).squeeze(3).squeeze(2) # B,C
+        x_fc = self.fc_seq(features)
         # Aggregate in frequency axis
         x = torch.mean(x, dim=2)
 
@@ -428,20 +650,21 @@ class BirdClefSEDAttModel(nn.Module):
                 "clipwise_output": clipwise_output,
                 "framewise_output":segmentwise_output,
                 "maxframewise_output":maxframewise_output,
-                "features":features
+                "features":features,
+                'clipwise_fc':x_fc
             }
         else:
             output_dict = {
                 "clipwise_output": clipwise_output,
                 "framewise_output":segmentwise_output,
-                "maxframewise_output":maxframewise_output
+                "maxframewise_output":maxframewise_output,
+                'clipwise_fc':x_fc
             }
 
         return output_dict
-    
 
 class BirdClefCNNModel(nn.Module):
-    def __init__(self, model_name=CFG.model, num_classes = CFG.num_classes, pretrained = CFG.pretrained,p=0.5):
+    def __init__(self, model_name=CFG.model, num_classes = CFG.num_classes, pretrained = CFG.pretrained,p=0.5,mel_bins=192):
         super().__init__()
         self.num_classes = num_classes
         self.backbone = timm.create_model(model_name, pretrained=pretrained)
@@ -454,7 +677,7 @@ class BirdClefCNNModel(nn.Module):
             self.backbone.conv_stem.stride = (1,1)
         self.SpecAug = SpecAugmentation(time_drop_width=64, time_stripes_num=2,freq_drop_width=8, freq_stripes_num=2)
         self.use_spec_aug = CFG.use_spec_aug
-        self.bn0 = nn.BatchNorm2d(CFG.mel_bins)
+        self.bn0 = nn.BatchNorm2d(mel_bins)
 
         # Spectrogram extractor
         self.spectrogram_extractor = MelSpectrogram(
@@ -465,7 +688,7 @@ class BirdClefCNNModel(nn.Module):
             f_min=CFG.fmin,
             f_max=CFG.fmax,
             pad=0,
-            n_mels=CFG.mel_bins,
+            n_mels=mel_bins,
             power=2,
             normalized=False,
         )
@@ -510,28 +733,22 @@ class BirdClefCNNModel(nn.Module):
         else:
             x = self.ml_decoder.forward(x,le=le)
             return x
-    
-class BirdClefCNNFCModel(BirdClefCNNModel):
-    def __init__(self, model_name=CFG.model, num_classes=CFG.num_classes, pretrained=CFG.pretrained, p=0.5):
-        super().__init__(model_name=model_name, num_classes=num_classes, pretrained=pretrained, p=0.5)
-        del self.ml_decoder
-        out_indices = (3, 4)
-        self.backbone = timm.create_model(
-            model_name=model_name,
-            features_only=True,
-            pretrained=pretrained,
-            in_chans=3,
-            num_classes=num_classes,
-            out_indices=out_indices,
-        )
-        feature_dims = self.backbone.feature_info.channels()
-        print(f"feature dims: {feature_dims}")
 
-        self.global_pools = torch.nn.ModuleList([GeM() for _ in out_indices])
-        self.mid_features = np.sum(feature_dims)
-        self.drop = nn.Dropout(0.1)
-        self.neck = torch.nn.BatchNorm1d(self.mid_features)
-        self.head = torch.nn.Linear(self.mid_features, num_classes)
+class BirdClefCNNFCModel(nn.Module):
+    def __init__(self, model_name=CFG.model, num_classes = CFG.num_classes, pretrained = CFG.pretrained,p=0.5,mel_bins=192):
+        super().__init__()
+        self.num_classes = num_classes
+        self.backbone = timm.create_model(model_name, pretrained=pretrained)
+        if 'effi' in model_name:
+            self.backbone.global_pool = nn.Identity()
+            self.backbone.classifier = nn.Identity()
+        elif 'eca' in model_name:
+            self.backbone.head.fc = nn.Identity()
+        if CFG.use_fsr:
+            self.backbone.conv_stem.stride = (1,1)
+        self.SpecAug = SpecAugmentation(time_drop_width=64, time_stripes_num=2,freq_drop_width=8, freq_stripes_num=2)
+        self.use_spec_aug = CFG.use_spec_aug
+        self.bn0 = nn.BatchNorm2d(mel_bins)
 
         # Spectrogram extractor
         self.spectrogram_extractor = MelSpectrogram(
@@ -542,13 +759,22 @@ class BirdClefCNNFCModel(BirdClefCNNModel):
             f_min=CFG.fmin,
             f_max=CFG.fmax,
             pad=0,
-            n_mels=CFG.mel_bins,
+            n_mels=mel_bins,
             power=2,
             normalized=False,
         )
         # Logmel feature extractor
         self.logmel_extractor = AmplitudeToDB(top_db=None)
         self.normlize = NormalizeMelSpec()
+
+        self.fc_seq = nn.Sequential(
+            nn.Dropout(0.2),
+            nn.Linear(self.backbone.num_features, self.backbone.num_features//2),
+            nn.PReLU(),
+            nn.BatchNorm1d(self.backbone.num_features//2),
+            nn.Dropout(0.1),
+            nn.Linear(self.backbone.num_features//2, num_classes),
+        )
 
     def get_mel_gram(self,audios):
         """
@@ -560,15 +786,48 @@ class BirdClefCNNFCModel(BirdClefCNNModel):
 
         return x
 
+    def forward(self,x:torch.Tensor,le=False):
+        x = x.contiguous()
+        # b c f t
+        if CFG.use_spec_aug and self.training:
+            if np.random.uniform(0,1)>CFG.p_spec_aug:
+                x = self.SpecAug(x)
+            if np.random.uniform(0,1)>CFG.p_spec_aug:
+                x = filt_aug(x.permute(0,3,1,2),filter_type='linear').permute(0,2,3,1)
+            if np.random.uniform(0,1)>CFG.p_spec_aug:
+                x = filt_aug(x.permute(0,3,1,2),filter_type='step').permute(0,2,3,1)
+            # if np.random.uniform(0,1)>CFG.p_spec_aug:
+            #     x = random_shift_along_H(x,mix_pro=0.5)
 
-    def forward(self, x):
-        ms = self.backbone(x)
-        h = torch.cat([global_pool(m) for m, global_pool in zip(ms, self.global_pools)], dim=1)
-        h = self.drop(h)
-        x = self.neck(h)
-        x = self.head(x)
+        x = self.backbone.forward_features(x)
+        x = torch.mean(x, dim=2)
+        x,_ = torch.max(x, dim=2)
+        x = self.fc_seq(x)
+
         return x
     
+class ModelEMA(nn.Module):
+    def __init__(self, model:nn.Module, decay=0.99, device=None):
+        super().__init__()
+        self.module = deepcopy(model)
+        self.module.eval()
+        self.decay = decay
+        self.device = device
+        if self.device is not None:
+            self.module.to(device=device)
+
+    def _update(self, model, update_fn):
+        with torch.no_grad():
+            for ema_v, model_v in zip(self.module.state_dict().values(), model.state_dict().values()):
+                if self.device is not None:
+                    model_v = model_v.to(device=self.device)
+                ema_v.copy_(update_fn(ema_v, model_v))
+
+    def update(self, model):
+        self._update(model, update_fn=lambda e, m: self.decay * e + (1. - self.decay) * m)
+
+    def set(self, model):
+        self._update(model, update_fn=lambda e, m: m)
 
 class PowerToDB(torch.nn.Module):
     """
@@ -619,18 +878,51 @@ class PowerToDB(torch.nn.Module):
 class TeacherModel(nn.Module):
     def __init__(self,device='cuda'):
         super().__init__()
-        self.model1 = BirdClefSEDAttModel(model_name='seresnext26d_32x4d',num_classes=CFG.num_classes,pretrained=True)
+        self.model1 = BirdClefSEDAttModel(model_name='eca_nfnet_l0',num_classes=CFG.num_classes,pretrained=True)
         self.model2 = BirdClefSEDAttModel(model_name='tf_efficientnetv2_b3',num_classes=CFG.num_classes,pretrained=True)
-        self.model3 = BirdClefCNNModel(model_name='tf_efficientnetv2_b3',num_classes=CFG.num_classes,pretrained=True)
-        self.model1.load_state_dict(torch.load('/root/projects/BirdClef2025/BirdCLEF2023-30th-place-solution-master/logs/2025-03-30T03:24-seresnext/saved_model_lastepoch.pt'))
-        self.model2.load_state_dict(torch.load('/root/projects/BirdClef2025/BirdCLEF2023-30th-place-solution-master/logs/2025-04-21T09:17-efv2b3-0.858/saved_model_lastepoch.pt'))
-        self.model3.load_state_dict(torch.load('/root/projects/BirdClef2025/BirdCLEF2023-30th-place-solution-master/logs/efv2b3_CNNMLDecoder_0416V4_LB0.839.pt'))
+        # self.model3 = BirdClefCNNFCModel(model_name='seresnext26t_32x4d',num_classes=CFG.num_classes,pretrained=True)
+        # self.model4 = BirdClefCNNFCModel(model_name='eca_nfnet_l0',num_classes=CFG.num_classes,pretrained=True)
+        self.model1.load_state_dict(torch.load('/root/projects/BirdClef2025/BirdCLEF2023-30th-place-solution-master/logs/2025-05-30T15:40-nfnet-selfkd-0.888/saved_model_lastepoch.pt'))
+        self.model2.load_state_dict(torch.load('/root/projects/BirdClef2025/BirdCLEF2023-30th-place-solution-master/logs/2025-05-27T16:26-efv2b3-0.905/saved_model_lastepoch.pt'))
+        # self.model3.load_state_dict(torch.load('/root/projects/BirdClef2025/BirdCLEF2023-30th-place-solution-master/logs/2025-06-02T15:48-seresnext-cnn-0.897/saved_model_lastepoch.pt'))
+        # self.model4.load_state_dict(torch.load('/root/projects/BirdClef2025/BirdCLEF2023-30th-place-solution-master/logs/2025-04-25T07:45-nfnetl0-0.841/saved_model_lastepoch.pt'))
         self.model1.eval()
         self.model2.eval()
-        self.model3.eval()
+        # self.model3.eval()
+        # self.model4.eval()
         self.mode1 = self.model1.to(device)
         self.mode2 = self.model2.to(device)
-        self.mode3 = self.model3.to(device)
+        # self.mode3 = self.model3.to(device)
+        # self.mode4 = self.model4.to(device)
+        self.device = device
+
+
+    @torch.no_grad
+    def forward(self,x):
+
+        pred1_dict = self.model1(x)
+        pred2_dict = self.model2(x)
+        # pred3 = torch.sigmoid(self.model3(x))
+        # pred4 = torch.sigmoid(self.model4(x))
+        pred1 = (pred1_dict['clipwise_output'] + pred1_dict['maxframewise_output'])/2 # B 206
+        pred2 = (pred2_dict['clipwise_output'] + pred2_dict['maxframewise_output'])/2 # B 206
+        pred = 0.3*pred1 + 0.7*pred2
+        # pred = pred3
+        # return pred,pred3
+        return pred,pred
+
+class FrameModel(nn.Module):
+    def __init__(self,device='cuda'):
+        super().__init__()
+        self.model1 = BirdClefSEDAttModel(model_name='tf_efficientnetv2_b3',num_classes=CFG.num_classes,pretrained=True)
+        self.model1.load_state_dict(torch.load('/root/projects/BirdClef2025/BirdCLEF2023-30th-place-solution-master/logs/2025-05-27T16:26-efv2b3-0.905/saved_model_lastepoch.pt'))
+        self.model1.eval()
+        self.mode1 = self.model1.to(device)
+
+        self.model2 = BirdClefSEDAttModel(model_name='eca_nfnet_l0',num_classes=CFG.num_classes,pretrained=True)
+        self.model2.load_state_dict(torch.load('/root/projects/BirdClef2025/BirdCLEF2023-30th-place-solution-master/logs/2025-05-30T15:40-nfnet-selfkd-0.888/saved_model_lastepoch.pt'))
+        self.model2.eval()
+        self.mode2 = self.model2.to(device)
         self.device = device
 
 
@@ -639,14 +931,12 @@ class TeacherModel(nn.Module):
 
         pred1_dict = self.model1(x,return_features)
         pred2_dict = self.model2(x,return_features)
-        pred3 = torch.sigmoid(self.model3(x))
-        pred1 = (pred1_dict['clipwise_output'] + pred1_dict['maxframewise_output'])/2 # B 206
-        pred2 = (pred2_dict['clipwise_output'] + pred2_dict['maxframewise_output'])/2 # B 206
-        pred = 0.4*pred1 + 0.4*pred2 + 0.2*pred3
-        if return_features:
-            return pred,pred2_dict['features']
-        else:
-            return pred
+
+        pred_dict = dict()
+        for key,value in pred1_dict.items():
+            pred_dict[key] = pred1_dict[key] * 0.7 + pred2_dict[key] * 0.3
+            # pred_dict[key] = pred1_dict[key]
+        return pred_dict
 
 if __name__ == '__main__':
 
@@ -672,7 +962,7 @@ if __name__ == '__main__':
     # pred = model(image,audio)
     # print(pred.shape)
     data = torch.randn((4,32000*10))
-    model = BirdClefCNNFCModel(model_name='tf_efficientnetv2_b3',num_classes=CFG.num_classes,pretrained=True)
+    model = BirdClefSEDAttModelDS(model_name='tf_efficientnetv2_b3',num_classes=CFG.num_classes,pretrained=True)
     data = model.get_mel_gram(data)
     data = torch.repeat_interleave(data.unsqueeze(1),repeats=3,dim=1)
     out = model.forward(data)
